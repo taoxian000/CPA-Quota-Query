@@ -69,23 +69,25 @@ const (
 	tpmRightButton   = 0x0002
 	tpmReturnCommand = 0x0100
 
-	nimAdd        = 0
-	nimModify     = 1
-	nimDelete     = 2
-	nimSetVer     = 4
-	nifMessage    = 1
-	nifIcon       = 2
-	nifTip        = 4
-	iconID        = 1
-	menuRefresh   = 1001
-	menuOpenPanel = 1002
-	menuTopmost   = 1003
-	menuStartup   = 1004
-	menuExit      = 1005
-	menuRefresh10 = 1010
-	menuRefresh20 = 1011
-	menuRefresh30 = 1012
-	menuRefresh60 = 1013
+	nimAdd            = 0
+	nimModify         = 1
+	nimDelete         = 2
+	nimSetVer         = 4
+	nifMessage        = 1
+	nifIcon           = 2
+	nifTip            = 4
+	iconID            = 1
+	menuRefresh       = 1001
+	menuOpenPanel     = 1002
+	menuTopmost       = 1003
+	menuStartup       = 1004
+	menuExit          = 1005
+	menuRefresh10     = 1010
+	menuRefresh20     = 1011
+	menuRefresh30     = 1012
+	menuRefresh60     = 1013
+	menuCheckUpdates  = 1014
+	menuInstallUpdate = 1015
 
 	mbOK              = 0x00000000
 	mbYesNo           = 0x00000004
@@ -313,30 +315,36 @@ type appSettings struct {
 }
 
 type appState struct {
-	mu          sync.RWMutex
-	quota       quotaSnapshot
-	status      string
-	updated     time.Time
-	settings    appSettings
-	startup     bool
-	resetResult string
+	mu              sync.RWMutex
+	quota           quotaSnapshot
+	status          string
+	updated         time.Time
+	settings        appSettings
+	startup         bool
+	resetResult     string
+	updateStatus    string
+	updateChecking  bool
+	updateAvailable bool
+	updateRelease   updateRelease
 }
 
 type monitorApp struct {
-	state          appState
-	mainWindow     syscall.Handle
-	panelWindow    syscall.Handle
-	instance       syscall.Handle
-	mutex          syscall.Handle
-	trayAdded      bool
-	panelVisible   bool
-	trayIcon       syscall.Handle
-	taskbarMsg     uint32
-	fetching       atomic.Bool
-	resetPending   atomic.Bool
-	intervalChange chan time.Duration
-	panelButton    string
-	menuOpen       bool
+	state            appState
+	mainWindow       syscall.Handle
+	panelWindow      syscall.Handle
+	instance         syscall.Handle
+	mutex            syscall.Handle
+	trayAdded        bool
+	panelVisible     bool
+	trayIcon         syscall.Handle
+	taskbarMsg       uint32
+	fetching         atomic.Bool
+	resetPending     atomic.Bool
+	checkingUpdate   atomic.Bool
+	installingUpdate atomic.Bool
+	intervalChange   chan time.Duration
+	panelButton      string
+	menuOpen         bool
 }
 
 var currentApp *monitorApp
@@ -366,6 +374,9 @@ func run() error {
 	app.state.settings = loadSettings()
 	app.state.startup = startupEnabled()
 	app.state.status = "等待首次同步"
+	if executable, err := os.Executable(); err == nil {
+		app.state.updateStatus = consumeUpdateFailure(executable)
+	}
 
 	instance, _, _ := procGetModuleHandle.Call(0)
 	if instance == 0 {
@@ -427,6 +438,7 @@ func run() error {
 	}
 	app.startFetch()
 	go app.refreshLoop()
+	go app.updateCheckLoop()
 	return app.messageLoop()
 }
 
@@ -682,6 +694,11 @@ func (a *monitorApp) tooltip() string {
 	if strings.HasPrefix(s.status, "同步失败") {
 		result += "\n" + s.status
 	}
+	if s.updateAvailable {
+		result += "\n可更新到 " + s.updateRelease.Tag
+	} else if s.updateStatus != "" {
+		result += "\n" + s.updateStatus
+	}
 	return result
 }
 
@@ -689,11 +706,15 @@ func (a *monitorApp) snapshot() appState {
 	a.state.mu.RLock()
 	defer a.state.mu.RUnlock()
 	return appState{
-		quota:    a.state.quota,
-		status:   a.state.status,
-		updated:  a.state.updated,
-		settings: a.state.settings,
-		startup:  a.state.startup,
+		quota:           a.state.quota,
+		status:          a.state.status,
+		updated:         a.state.updated,
+		settings:        a.state.settings,
+		startup:         a.state.startup,
+		updateStatus:    a.state.updateStatus,
+		updateChecking:  a.state.updateChecking,
+		updateAvailable: a.state.updateAvailable,
+		updateRelease:   a.state.updateRelease,
 	}
 }
 
@@ -809,6 +830,16 @@ func (a *monitorApp) showMenu() {
 	defer procDestroyMenu.Call(menu)
 	a.menuOpen = true
 	appendMenu(menu, 0, menuRefresh, "立即刷新")
+	appendMenu(menu, 0, menuCheckUpdates, "检查更新")
+	if snapshot := a.snapshot(); snapshot.updateAvailable {
+		flags := uintptr(0)
+		label := "更新到 " + snapshot.updateRelease.Tag
+		if a.installingUpdate.Load() {
+			flags = 0x0001
+			label = "正在更新…"
+		}
+		appendMenu(menu, flags, menuInstallUpdate, label)
+	}
 	appendMenu(menu, 0x00000800, 0, "")
 	intervalMenu, _, _ := procCreatePopupMenu.Call()
 	if intervalMenu != 0 {
@@ -875,6 +906,8 @@ func (a *monitorApp) handlePanelButton(button string) {
 		a.resetQuota()
 	case "topmost":
 		a.toggleAlwaysOnTop()
+	case "update":
+		a.installUpdate()
 	}
 }
 
@@ -882,6 +915,8 @@ func (a *monitorApp) panelButtonAt(pt point) string {
 	switch {
 	case containsPoint(panelResetButtonRect(46, nominalCardHeight(a.snapshot().quota.Nominal)), pt):
 		return "reset"
+	case containsPoint(panelUpdateButtonRect(), pt) && a.snapshot().updateAvailable && !a.installingUpdate.Load() && !strings.HasPrefix(a.snapshot().updateStatus, "更新失败"):
+		return "update"
 	case containsPoint(panelThemeButtonRect(), pt):
 		return "theme"
 	case containsPoint(panelTopmostButtonRect(), pt):
@@ -904,6 +939,10 @@ func panelResetButtonRect(top, height int32) rect {
 
 func panelThemeButtonRect() rect {
 	return rect{Left: panelWidth - 204, Top: 6, Right: panelWidth - 112, Bottom: 36}
+}
+
+func panelUpdateButtonRect() rect {
+	return rect{Left: 196, Top: 6, Right: panelWidth - 210, Bottom: 36}
 }
 
 func panelMinimizeButtonRect() rect {
@@ -943,6 +982,10 @@ func (a *monitorApp) handleMenuCommand(command uint16) {
 	switch command {
 	case menuRefresh:
 		a.startFetch()
+	case menuCheckUpdates:
+		a.checkForUpdate(true)
+	case menuInstallUpdate:
+		a.installUpdate()
 	case menuRefresh10:
 		a.setRefreshInterval(10)
 	case menuRefresh20:
@@ -1123,7 +1166,19 @@ func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
 		themeLabel = "暗色"
 	}
 	drawText(hdc, "Codex 额度监控", rect{Left: 18, Top: 6, Right: 190, Bottom: 36}, colors.text, dtSingleLine|dtVCenter)
-	drawText(hdc, s.status, rect{Left: 196, Top: 6, Right: panelWidth - 210, Bottom: 36}, colors.muted, dtSingleLine|dtVCenter|dtEndEllipsis)
+	if s.updateAvailable && !strings.HasPrefix(s.updateStatus, "更新失败") {
+		label := "更新到 " + s.updateRelease.Tag
+		if a.installingUpdate.Load() {
+			label = "正在更新…"
+		}
+		drawPanelButton(hdc, panelUpdateButtonRect(), label, colors)
+	} else {
+		headerStatus := s.updateStatus
+		if headerStatus == "" {
+			headerStatus = s.status
+		}
+		drawText(hdc, headerStatus, panelUpdateButtonRect(), colors.muted, dtSingleLine|dtVCenter|dtEndEllipsis)
+	}
 	drawPanelButton(hdc, panelThemeButtonRect(), themeLabel, colors)
 	drawPinButton(hdc, panelTopmostButtonRect(), colors, s.settings.AlwaysOnTop)
 	drawPanelButton(hdc, panelMinimizeButtonRect(), "—", colors)
@@ -1780,7 +1835,23 @@ func quotaRemainingText(bucket quotaBucket, now time.Time) string {
 	if bucket.ResetAt.IsZero() {
 		return "剩余时间：--"
 	}
-	return "剩余时间：" + strings.ReplaceAll(remainingTime(bucket.ResetAt.Sub(now)), " ", "")
+	remaining := bucket.ResetAt.Sub(now)
+	if remaining <= 0 {
+		return "剩余时间：已到期"
+	}
+	if remaining < time.Hour {
+		minutes := int(remaining.Minutes())
+		if minutes < 1 {
+			minutes = 1
+		}
+		return fmt.Sprintf("剩余时间：%d分", minutes)
+	}
+	hours := int(remaining.Hours())
+	if hours >= 24 {
+		return fmt.Sprintf("剩余时间：%d天%d小时", hours/24, hours%24)
+	}
+	minutes := int(remaining.Minutes()) % 60
+	return fmt.Sprintf("剩余时间：%d小时%d分", hours, minutes)
 }
 
 func shortError(s string) string {

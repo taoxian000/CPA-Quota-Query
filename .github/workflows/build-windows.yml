@@ -6,7 +6,7 @@ on:
       - "**"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows-amd64:
@@ -25,15 +25,33 @@ jobs:
         run: go test ./...
 
       - name: Build Windows AMD64 executable
-        run: go build -trimpath -ldflags="-H=windowsgui" -o quota-monitor.exe .
+        run: go build -trimpath "-ldflags=-H=windowsgui -X main.appVersion=$env:APP_VERSION" -o quota-monitor-windows-amd64.exe .
         env:
           GOOS: windows
           GOARCH: amd64
+          APP_VERSION: ${{ github.ref_name }}
 
       - name: Upload executable
         uses: actions/upload-artifact@v7
         with:
           name: quota-monitor-windows-amd64-${{ github.ref_name }}
-          path: quota-monitor.exe
+          path: quota-monitor-windows-amd64.exe
           if-no-files-found: error
           retention-days: 30
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ github.ref_name }}
+        run: |
+          if ($env:APP_VERSION -notmatch '^v\d+\.\d+(?:\.\d+)?$') {
+            Write-Host "Tag is not a supported stable version; skipping Release."
+            exit 0
+          }
+          gh release view $env:APP_VERSION *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:APP_VERSION .\quota-monitor-windows-amd64.exe --clobber
+          } else {
+            gh release create $env:APP_VERSION .\quota-monitor-windows-amd64.exe --verify-tag --generate-notes --title $env:APP_VERSION
+          }

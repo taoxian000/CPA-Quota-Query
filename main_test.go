@@ -3,12 +3,153 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestCompareVersions(t *testing.T) {
+	tests := []struct {
+		left, right string
+		want        int
+		wantErr     bool
+	}{
+		{left: "v1.1", right: "v1.1.0", want: 0},
+		{left: "v1.10", right: "v1.9", want: 1},
+		{left: "v2.0.0", right: "v2.1", want: -1},
+		{left: "v1.1-beta", right: "v1.1", wantErr: true},
+		{left: "1.1", right: "v1.1", wantErr: true},
+		{left: "v01.1", right: "v1.1", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.left+"_vs_"+tt.right, func(t *testing.T) {
+			got, err := compareVersions(tt.left, tt.right)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("compareVersions() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil && got != tt.want {
+				t.Fatalf("compareVersions() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSelectReleaseAsset(t *testing.T) {
+	data := []byte("verified update")
+	digest := sha256.Sum256(data)
+	valid := githubRelease{
+		TagName: "v1.2",
+		Assets: []releaseAsset{{
+			Name:               updateAssetName,
+			BrowserDownloadURL: "https://github.com/taoxian000/CPA-Quota-Query/releases/download/v1.2/" + updateAssetName,
+			Digest:             "sha256:" + hex.EncodeToString(digest[:]),
+			Size:               int64(len(data)),
+		}},
+	}
+	got, err := selectReleaseAsset(valid)
+	if err != nil {
+		t.Fatalf("selectReleaseAsset() error = %v", err)
+	}
+	if got.Tag != "v1.2" || got.Size != int64(len(data)) {
+		t.Fatalf("selected release = %+v", got)
+	}
+
+	tests := []struct {
+		name    string
+		release githubRelease
+	}{
+		{name: "missing exe", release: githubRelease{TagName: "v1.2"}},
+		{name: "prerelease", release: githubRelease{TagName: "v1.2", Prerelease: true, Assets: valid.Assets}},
+		{name: "invalid tag", release: githubRelease{TagName: "v1.2-rc1", Assets: valid.Assets}},
+		{name: "invalid download host", release: githubRelease{TagName: "v1.2", Assets: []releaseAsset{{Name: updateAssetName, BrowserDownloadURL: "https://example.com/app.exe", Digest: valid.Assets[0].Digest, Size: valid.Assets[0].Size}}}},
+		{name: "missing digest", release: githubRelease{TagName: "v1.2", Assets: []releaseAsset{{Name: updateAssetName, BrowserDownloadURL: valid.Assets[0].BrowserDownloadURL, Size: valid.Assets[0].Size}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := selectReleaseAsset(tt.release); err == nil {
+				t.Fatal("selectReleaseAsset() expected an error")
+			}
+		})
+	}
+}
+
+func TestFetchLatestRelease(t *testing.T) {
+	data := []byte("release payload")
+	digest := sha256.Sum256(data)
+	encoded, err := json.Marshal(githubRelease{
+		TagName: "v1.2",
+		Assets: []releaseAsset{{
+			Name:               updateAssetName,
+			BrowserDownloadURL: "https://github.com/taoxian000/CPA-Quota-Query/releases/download/v1.2/" + updateAssetName,
+			Digest:             "sha256:" + hex.EncodeToString(digest[:]),
+			Size:               int64(len(data)),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Accept") != "application/vnd.github+json" {
+			t.Errorf("Accept header = %q", r.Header.Get("Accept"))
+		}
+		_, _ = w.Write(encoded)
+	}))
+	defer server.Close()
+	release, err := fetchLatestRelease(server.Client(), server.URL)
+	if err != nil {
+		t.Fatalf("fetchLatestRelease() error = %v", err)
+	}
+	if release.Tag != "v1.2" {
+		t.Fatalf("release tag = %q", release.Tag)
+	}
+
+	missing := httptest.NewServer(http.NotFoundHandler())
+	defer missing.Close()
+	if _, err := fetchLatestRelease(missing.Client(), missing.URL); !errors.Is(err, errNoRelease) {
+		t.Fatalf("404 error = %v, want errNoRelease", err)
+	}
+}
+
+func TestDownloadAndVerifyChecksDigestAndSize(t *testing.T) {
+	data := []byte("executable test payload")
+	digest := sha256.Sum256(data)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	release := updateRelease{URL: server.URL, Digest: hex.EncodeToString(digest[:]), Size: int64(len(data))}
+	path, err := downloadAndVerify(server.Client(), release)
+	if err != nil {
+		t.Fatalf("downloadAndVerify() error = %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(path) })
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(data) {
+		t.Fatalf("downloaded data = %q, want %q", got, data)
+	}
+
+	wrongDigest := release
+	wrongDigest.Digest = strings.Repeat("0", 64)
+	if _, err := downloadAndVerify(server.Client(), wrongDigest); err == nil || !strings.Contains(err.Error(), "SHA-256") {
+		t.Fatalf("mismatch error = %v, want SHA-256 error", err)
+	}
+	wrongSize := release
+	wrongSize.Size++
+	if _, err := downloadAndVerify(server.Client(), wrongSize); err == nil || !strings.Contains(err.Error(), "大小") {
+		t.Fatalf("size mismatch error = %v, want size error", err)
+	}
+}
 
 func TestFetchQuotaRetriesFiveTimes(t *testing.T) {
 	attempts := 0
@@ -73,9 +214,10 @@ func TestQuotaRemainingTextFormatsHoursDaysAndMinutes(t *testing.T) {
 		at   time.Time
 		want string
 	}{
-		{name: "hours", at: now.Add(4*time.Hour + 45*time.Minute), want: "剩余时间：4小时"},
+		{name: "hours and minutes", at: now.Add(4*time.Hour + 45*time.Minute), want: "剩余时间：4小时45分"},
 		{name: "days and hours", at: now.Add(6*24*time.Hour + 3*time.Hour + 20*time.Minute), want: "剩余时间：6天3小时"},
-		{name: "minutes under an hour", at: now.Add(42 * time.Minute), want: "剩余时间：42分钟"},
+		{name: "minutes under an hour", at: now.Add(42 * time.Minute), want: "剩余时间：42分"},
+		{name: "sub-minute rounds up", at: now.Add(30 * time.Second), want: "剩余时间：1分"},
 		{name: "expired", at: now.Add(-time.Minute), want: "剩余时间：已到期"},
 	}
 	for _, tt := range tests {
