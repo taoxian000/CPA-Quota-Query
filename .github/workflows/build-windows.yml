@@ -1,0 +1,39 @@
+name: Build Windows AMD64
+
+on:
+  push:
+    tags:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-amd64:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build Windows AMD64 executable
+        run: go build -trimpath -ldflags="-H=windowsgui" -o quota-monitor.exe .
+        env:
+          GOOS: windows
+          GOARCH: amd64
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: quota-monitor-windows-amd64-${{ github.ref_name }}
+          path: quota-monitor.exe
+          if-no-files-found: error
+          retention-days: 30
