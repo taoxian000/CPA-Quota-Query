@@ -1,41 +1,47 @@
-# Codex Quota Tray Monitor
+# Codex 额度托盘监控
 
-A small Windows tray monitor for the Codex quota endpoint. It uses Go's
-standard library and Win32 APIs, with no third-party packages or runtime
-installation required on the target PC.
+一个轻量级 Windows 系统托盘程序，用于查看 Codex 额度和重置额度信息。程序使用 Go 标准库与 Windows 原生 API，不依赖 Electron，也无需在目标电脑上安装额外运行时。
 
-## Build
+## 重要依赖：CPA-Plugin-userrouting
 
-Run build.bat with Go installed. It creates quota-monitor.exe in this
-folder. The executable is a Windows GUI program, so it does not open a console.
+**本项目依赖 [CPA-Plugin-userrouting](https://github.com/taoxian000/cpa-plugin-userrouting) 提供的额度查询与重置接口，不是独立的额度查询后端。** 如果 CPA 未加载该插件、插件未启用公开资源接口，或请求中使用的 CPA 下游 API Key 无效，额度查询将无法工作。
 
-Pushing any Git tag runs the GitHub Actions workflow, which tests the project
-and builds a Windows AMD64 executable. The executable is published as a
-workflow artifact.
+使用前需满足：
 
-## Use
+- CPA 版本为 **v7.3.9 或更高版本**，并支持插件所需的 `QuotaProvider` ABI。
+- 已安装并加载 `CPA-Plugin-userrouting`，且启用额度提供方及公开资源接口：
 
-- The tray icon draws the actual account's remaining 5-hour and weekly quota.
-- Left-click the icon to show or hide the wider panel.
-- Drag the panel with the left mouse button; its position is saved and restored
-  on subsequent openings and launches.
-- The nominal-account card stacks its name and quota bars above the reset-credit
-  section, which shows every returned expiry time and remaining time. The reset
-  button asks for confirmation, consumes
-  one credit for each account covered by the server's nominal prefix, displays
-  the server result, and then refreshes the panel. A timed-out reset is not
-  retried automatically because its final server-side state may be uncertain.
-- The panel displays both nominal and actual account names and quota bars. Its
-  title bar has a light/dark/follow-system theme switch, an always-on-top toggle,
-  minimize, and exit buttons; right-clicking the panel opens the tray menu.
-- Right-click to refresh, open the window once, toggle always-on-top, enable
-  startup at Windows sign-in, or exit.
-- The app refreshes every 10 minutes by default. Right-click the tray icon to
-  choose 10 minutes, 20 minutes, 30 minutes, or 1 hour; the choice is saved.
-- The app reads the auth.json file under the current user's .codex folder for
-  OPENAI_API_KEY.
-- The selected panel options are stored under the current user's app config
-  directory. The startup option uses the current user's Windows Run registry key.
+  ```yaml
+  quota_provider:
+    enabled: true
+    public_endpoint: true
+  ```
 
-All quota bars transition continuously from red through blue to green as the
-remaining percentage increases.
+- CPA 服务端可访问，且暴露以下插件资源路由：
+
+  ```text
+  GET /v0/resource/plugins/user-routing/quota
+  GET /v0/resource/plugins/user-routing/quota/reset
+  ```
+
+程序从当前 Windows 用户的 `%USERPROFILE%\.codex\auth.json` 读取 `OPENAI_API_KEY`，并将其作为 **CPA 下游 API Key** 发送给上述接口。该值必须是 CPA 接受的下游 Key；仅有普通 OpenAI API Key 并不能替代 CPA 插件或其 API Key 配置。
+
+## 构建
+
+本地安装 Go 1.22 或更高版本后，运行 `build.bat`。脚本会在当前目录生成 `quota-monitor.exe`（Windows AMD64 GUI 程序，不会打开控制台窗口）。
+
+推送任意 Git tag 会触发 GitHub Actions：运行测试、构建 Windows AMD64 程序，并将 exe 上传为保留 30 天的工作流 artifact。
+
+## 功能
+
+- 托盘图标显示实际账户的 5 小时额度和周额度。
+- 单击托盘图标可显示或隐藏面板；面板可拖动，位置会保存。
+- 面板同时显示名义账户和实际账户、两条额度进度条及各自的额度重置倒计时。倒计时每分钟更新；不足一小时显示分钟。
+- 名义账户区域显示可用重置次数、已返回的到期时间和剩余时间。重置按钮会二次确认，调用插件的重置接口，并在返回后提示结果、刷新额度。
+- **重置操作有服务端副作用**：插件会对该 Key 对应名义前缀下符合条件的账户尝试消耗重置额度；请求超时后程序不会自动重试，以免重复消费。公开重置接口不会清除 CPA 本地额度冷却状态。
+- 额度查询失败后最多重试 5 次（含首次请求共最多 6 次），采用递增间隔；重置请求不自动重试。
+- 面板支持亮色、暗色和跟随系统主题，以及始终置顶、最小化和退出按钮；右键菜单提供刷新、打开面板、开机启动、刷新间隔设置和退出。
+- 刷新间隔默认为 10 分钟，可设置为 10 分钟、20 分钟、30 分钟或 1 小时。
+- 所有额度条随剩余百分比从红色渐变至蓝色、绿色。
+
+面板设置保存在当前用户的应用配置目录；开机启动使用当前用户的 Windows Run 注册表项。
