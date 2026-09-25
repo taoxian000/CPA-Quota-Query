@@ -26,8 +26,11 @@ import (
 
 const (
 	apiURL              = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota"
+	directAPIURL        = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota/direct"
 	resetAPIURL         = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota/reset"
 	authRelPath         = ".codex\\auth.json"
+	authModeAPIKey      = "apikey"
+	authModeChatGPT     = "chatgpt"
 	quotaRequestRetries = 5
 
 	classMain  = "QuotaTrayMonitorMainWindow"
@@ -301,8 +304,13 @@ type resetCreditInfo struct {
 }
 
 type quotaSnapshot struct {
-	Nominal accountQuota
-	Actual  accountQuota
+	Nominal          accountQuota
+	Actual           accountQuota
+	NominalAvailable bool
+	ActualAvailable  bool
+	SingleAccount    bool
+	DirectMode       bool
+	ResetSupported   bool
 }
 
 type appSettings struct {
@@ -419,7 +427,7 @@ func run() error {
 		uintptr(unsafe.Pointer(panelClass)),
 		uintptr(unsafe.Pointer(title)),
 		wsPopup,
-		0, 0, panelWidth, uintptr(panelHeightFor(accountQuota{})),
+		0, 0, panelWidth, uintptr(panelHeightFor(quotaSnapshot{})),
 		hwnd, 0,
 		uintptr(app.instance),
 		0,
@@ -636,7 +644,7 @@ func (a *monitorApp) refreshLoop() {
 }
 
 func (a *monitorApp) addTrayIcon() error {
-	icon := createTrayIcon(a.snapshot().quota.Actual)
+	icon := createTrayIcon(trayAccount(a.snapshot().quota))
 	if icon == 0 {
 		return winError("CreateIconIndirect")
 	}
@@ -686,11 +694,12 @@ func (a *monitorApp) notifyData(icon syscall.Handle) notifyIconData {
 
 func (a *monitorApp) tooltip() string {
 	s := a.snapshot()
-	name := s.quota.Actual.Email
+	account := trayAccount(s.quota)
+	name := account.Email
 	if name == "" {
 		name = "实际账户"
 	}
-	result := fmt.Sprintf("%s\n5小时剩余：%s  周额度剩余：%s", name, bucketText(s.quota.Actual.Primary), bucketText(s.quota.Actual.Secondary))
+	result := fmt.Sprintf("%s\n5小时剩余：%s  周额度剩余：%s", name, bucketText(account.Primary), bucketText(account.Secondary))
 	if strings.HasPrefix(s.status, "同步失败") {
 		result += "\n" + s.status
 	}
@@ -700,6 +709,19 @@ func (a *monitorApp) tooltip() string {
 		result += "\n" + s.updateStatus
 	}
 	return result
+}
+
+func trayAccount(quota quotaSnapshot) accountQuota {
+	if quota.NominalAvailable && (quota.SingleAccount || !quota.ActualAvailable) {
+		return quota.Nominal
+	}
+	if quota.ActualAvailable {
+		return quota.Actual
+	}
+	if quota.NominalAvailable {
+		return quota.Nominal
+	}
+	return quota.Actual
 }
 
 func (a *monitorApp) snapshot() appState {
@@ -724,7 +746,7 @@ func (a *monitorApp) showPanel() {
 	}
 	snapshot := a.snapshot()
 	settings := snapshot.settings
-	height := panelHeightFor(snapshot.quota.Nominal)
+	height := panelHeightFor(snapshot.quota)
 	var x, y int32
 	if settings.PositionSet {
 		x, y = clampPanelPosition(settings.PanelX, settings.PanelY, height)
@@ -756,7 +778,7 @@ func (a *monitorApp) resizePanel() {
 	if r, _, _ := procGetWindowRect.Call(uintptr(a.panelWindow), uintptr(unsafe.Pointer(&bounds))); r == 0 {
 		return
 	}
-	height := panelHeightFor(a.snapshot().quota.Nominal)
+	height := panelHeightFor(a.snapshot().quota)
 	x, y := clampPanelPosition(bounds.Left, bounds.Top, height)
 	procSetWindowPos.Call(uintptr(a.panelWindow), 0, uintptr(x), uintptr(y), panelWidth, uintptr(height), swpNoActivate|swpNoZOrder)
 }
@@ -913,7 +935,7 @@ func (a *monitorApp) handlePanelButton(button string) {
 
 func (a *monitorApp) panelButtonAt(pt point) string {
 	switch {
-	case containsPoint(panelResetButtonRect(46, nominalCardHeight(a.snapshot().quota.Nominal)), pt):
+	case containsPoint(panelResetButtonRect(46, nominalCardHeight(a.snapshot().quota.Nominal)), pt) && a.snapshot().quota.ResetSupported:
 		return "reset"
 	case containsPoint(panelUpdateButtonRect(), pt) && a.snapshot().updateAvailable && !a.installingUpdate.Load() && !strings.HasPrefix(a.snapshot().updateStatus, "更新失败"):
 		return "update"
@@ -1058,6 +1080,10 @@ func (a *monitorApp) resetQuota() {
 		return
 	}
 	snapshot := a.snapshot()
+	if !snapshot.quota.ResetSupported {
+		showMessageBox(a.panelWindow, "当前认证方式仅支持查询额度，不支持此重置操作。", mbOK|mbIconInformation)
+		return
+	}
 	if snapshot.quota.Nominal.Reset.AvailableCount < 1 {
 		showMessageBox(a.panelWindow, "当前没有可用的重置次数，因此没有发送请求。", mbOK|mbIconInformation)
 		return
@@ -1143,7 +1169,7 @@ func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
 
 	background := createBrush(colors.background)
 	defer procDeleteObject.Call(uintptr(background))
-	full := rect{Right: panelWidth, Bottom: panelHeightFor(s.quota.Nominal)}
+	full := rect{Right: panelWidth, Bottom: panelHeightFor(s.quota)}
 	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&full)), uintptr(background))
 	procSetBkMode.Call(hdc, 1)
 	fontFace, _ := syscall.UTF16PtrFromString("Microsoft YaHei UI")
@@ -1186,9 +1212,11 @@ func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
 
 	nominalTop := int32(46)
 	nominalHeight := nominalCardHeight(s.quota.Nominal)
-	drawNominalAccountCard(hdc, colors, nominalTop, nominalHeight, s.quota.Nominal)
-	actualTop := nominalTop + nominalHeight + 10
-	drawActualAccountCard(hdc, colors, actualTop, s.quota.Actual)
+	drawNominalAccountCard(hdc, colors, nominalTop, nominalHeight, s.quota.Nominal, s.quota.DirectMode, s.quota.SingleAccount, s.quota.ResetSupported)
+	if s.quota.ActualAvailable {
+		actualTop := nominalTop + nominalHeight + 10
+		drawActualAccountCard(hdc, colors, actualTop, s.quota.Actual)
+	}
 }
 
 func drawPanelButton(hdc uintptr, bounds rect, label string, colors panelColors) {
@@ -1223,20 +1251,33 @@ func drawPinButton(hdc uintptr, bounds rect, colors panelColors, enabled bool) {
 	drawText(hdc, "📌", bounds, iconColor, dtSingleLine|dtVCenter|dtCenter)
 }
 
-func drawNominalAccountCard(hdc uintptr, colors panelColors, top, height int32, account accountQuota) {
+func drawNominalAccountCard(hdc uintptr, colors panelColors, top, height int32, account accountQuota, directMode, singleAccount, resetSupported bool) {
 	drawCardBackground(hdc, colors, top, height)
-	drawText(hdc, "名义账户  ·  "+accountEmail(account),
+	accountTitle := nominalAccountTitle(directMode, singleAccount)
+	drawText(hdc, accountTitle+"  ·  "+accountEmail(account),
 		rect{Left: 27, Top: top + 5, Right: panelWidth - 25, Bottom: top + 29}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
 	drawMeter(hdc, "5小时", 27, top+38, account.Primary, colors)
 	drawMeter(hdc, "周额度", 27, top+62, account.Secondary, colors)
 	drawHorizontalDivider(hdc, 27, panelWidth-27, top+83, colors.border)
 	drawText(hdc, fmt.Sprintf("重置次数  ·  %d 次", account.Reset.AvailableCount),
 		rect{Left: 27, Top: top + 86, Right: panelWidth - 74, Bottom: top + 109}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
-	drawPanelButton(hdc, panelResetButtonRect(top, height), "↻", colors)
+	if resetSupported {
+		drawPanelButton(hdc, panelResetButtonRect(top, height), "↻", colors)
+	}
 	for i, line := range resetCreditLines(account.Reset, time.Now()) {
 		rowTop := top + 112 + int32(i)*20
 		drawText(hdc, line, rect{Left: 27, Top: rowTop, Right: panelWidth - 72, Bottom: rowTop + 19}, colors.muted, dtSingleLine|dtVCenter|dtEndEllipsis)
 	}
+}
+
+func nominalAccountTitle(directMode, singleAccount bool) string {
+	if singleAccount {
+		return "账户"
+	}
+	if directMode {
+		return "ChatGPT 账户"
+	}
+	return "名义账户"
 }
 
 func drawActualAccountCard(hdc uintptr, colors panelColors, top int32, account accountQuota) {
@@ -1413,8 +1454,12 @@ func nominalCardHeight(account accountQuota) int32 {
 	return int32(122 + rows*20)
 }
 
-func panelHeightFor(account accountQuota) int32 {
-	return 46 + nominalCardHeight(account) + 10 + actualCardHeight + 14
+func panelHeightFor(quota quotaSnapshot) int32 {
+	height := int32(46) + nominalCardHeight(quota.Nominal) + 14
+	if quota.ActualAvailable {
+		height += 10 + actualCardHeight
+	}
+	return height
 }
 
 func resetCreditLines(info resetCreditInfo, now time.Time) []string {
@@ -1550,6 +1595,10 @@ type responseEnvelope struct {
 	Actual  json.RawMessage "json:\"actual_accounts\""
 }
 
+type directResponseEnvelope struct {
+	Accounts map[string]json.RawMessage `json:"accounts"`
+}
+
 type quotaResetResponse struct {
 	Success         bool                               `json:"success"`
 	Partial         bool                               `json:"partial"`
@@ -1580,13 +1629,13 @@ type quotaBucketRaw struct {
 }
 
 func fetchQuota() (quotaSnapshot, error) {
-	apiKey, err := readDownstreamAPIKey()
+	credentials, err := readQuotaCredentials()
 	if err != nil {
 		return quotaSnapshot{}, err
 	}
 	client := &http.Client{Timeout: 12 * time.Second}
 	return fetchQuotaWithRetry(func() (quotaSnapshot, error) {
-		return fetchQuotaOnce(client, apiKey)
+		return fetchQuotaUsingAuth(client, credentials, apiURL, directAPIURL)
 	}, time.Sleep)
 }
 
@@ -1611,8 +1660,23 @@ func fetchQuotaWithRetry(request func() (quotaSnapshot, error), sleep func(time.
 }
 
 func fetchQuotaOnce(client *http.Client, apiKey string) (quotaSnapshot, error) {
+	return fetchQuotaAt(client, apiURL, apiKey)
+}
+
+func fetchQuotaUsingAuth(client *http.Client, credentials quotaCredentials, apiKeyEndpoint, chatGPTEndpoint string) (quotaSnapshot, error) {
+	switch credentials.Mode {
+	case authModeAPIKey:
+		return fetchQuotaAt(client, apiKeyEndpoint, credentials.APIKey)
+	case authModeChatGPT:
+		return fetchDirectQuotaAt(client, chatGPTEndpoint, credentials.AccessToken, credentials.AccountID)
+	default:
+		return quotaSnapshot{}, errors.New("auth.json 中 auth_mode 不受支持")
+	}
+}
+
+func fetchQuotaAt(client *http.Client, endpoint, apiKey string) (quotaSnapshot, error) {
 	var result quotaSnapshot
-	req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return result, err
 	}
@@ -1630,29 +1694,145 @@ func fetchQuotaOnce(client *http.Client, apiKey string) (quotaSnapshot, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return result, fmt.Errorf("解析额度响应失败：%w", err)
 	}
-	result.Nominal = parseAccount(envelope.Nominal)
-	result.Actual = parseAccount(envelope.Actual)
-	return result, nil
+	return parseQuotaEnvelope(envelope), nil
+}
+
+func fetchDirectQuotaAt(client *http.Client, endpoint, accessToken, accountID string) (quotaSnapshot, error) {
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return quotaSnapshot{}, err
+	}
+	req.Header.Set("User-Agent", "QuotaTrayMonitor/1.0")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("ChatGPT-Account-ID", accountID)
+	resp, err := client.Do(req)
+	if err != nil {
+		return quotaSnapshot{}, fmt.Errorf("直接额度接口请求失败：%w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return quotaSnapshot{}, fmt.Errorf("直接额度接口返回 HTTP %d", resp.StatusCode)
+	}
+	var envelope directResponseEnvelope
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		return quotaSnapshot{}, fmt.Errorf("解析直接额度响应失败：%w", err)
+	}
+	return parseDirectQuotaEnvelope(envelope)
+}
+
+func parseQuotaEnvelope(envelope responseEnvelope) quotaSnapshot {
+	nominalCount := countAccounts(envelope.Nominal)
+	actualCount := countAccounts(envelope.Actual)
+	return quotaSnapshot{
+		Nominal:          parseAccount(envelope.Nominal),
+		Actual:           parseAccount(envelope.Actual),
+		NominalAvailable: nominalCount > 0,
+		ActualAvailable:  actualCount > 0,
+		SingleAccount:    nominalCount+actualCount == 1,
+		ResetSupported:   true,
+	}
+}
+
+func parseDirectQuotaEnvelope(envelope directResponseEnvelope) (quotaSnapshot, error) {
+	if len(envelope.Accounts) == 0 {
+		return quotaSnapshot{}, errors.New("直接额度响应中没有账户数据")
+	}
+	accountsJSON, err := json.Marshal(envelope.Accounts)
+	if err != nil {
+		return quotaSnapshot{}, errors.New("解析直接额度账户数据失败")
+	}
+	return quotaSnapshot{
+		Nominal:          parseAccount(accountsJSON),
+		NominalAvailable: true,
+		SingleAccount:    len(envelope.Accounts) == 1,
+		DirectMode:       true,
+	}, nil
+}
+
+func hasActualAccounts(raw json.RawMessage) bool {
+	return countAccounts(raw) > 0
+}
+
+func countAccounts(raw json.RawMessage) int {
+	value := bytes.TrimSpace(raw)
+	if len(value) == 0 || value[0] != '{' {
+		return 0
+	}
+	var accounts map[string]json.RawMessage
+	if err := json.Unmarshal(value, &accounts); err != nil {
+		return 0
+	}
+	return len(accounts)
+}
+
+type quotaCredentials struct {
+	Mode        string
+	APIKey      string
+	AccessToken string
+	AccountID   string
+}
+
+func readQuotaCredentials() (quotaCredentials, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return quotaCredentials{}, err
+	}
+	return readQuotaCredentialsFromPath(filepath.Join(home, authRelPath))
+}
+
+func readQuotaCredentialsFromPath(path string) (quotaCredentials, error) {
+	authBytes, err := os.ReadFile(path)
+	if err != nil {
+		return quotaCredentials{}, fmt.Errorf("读取 Codex 凭据失败：%w", err)
+	}
+	credentials, err := parseQuotaCredentials(authBytes)
+	if err != nil {
+		return quotaCredentials{}, fmt.Errorf("解析 Codex 凭据失败：%w", err)
+	}
+	return credentials, nil
+}
+
+func parseQuotaCredentials(authBytes []byte) (quotaCredentials, error) {
+	var auth struct {
+		AuthMode string          `json:"auth_mode"`
+		APIKey   json.RawMessage `json:"OPENAI_API_KEY"`
+		Tokens   struct {
+			AccessToken string `json:"access_token"`
+			AccountID   string `json:"account_id"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(authBytes, &auth); err != nil {
+		return quotaCredentials{}, err
+	}
+	mode := strings.ToLower(strings.TrimSpace(auth.AuthMode))
+	switch mode {
+	case "", authModeAPIKey:
+		var apiKey string
+		if len(auth.APIKey) == 0 || string(bytes.TrimSpace(auth.APIKey)) == "null" || json.Unmarshal(auth.APIKey, &apiKey) != nil || strings.TrimSpace(apiKey) == "" {
+			return quotaCredentials{}, errors.New("auth.json 中未找到有效的 OPENAI_API_KEY")
+		}
+		return quotaCredentials{Mode: authModeAPIKey, APIKey: apiKey}, nil
+	case authModeChatGPT:
+		accessToken := strings.TrimSpace(auth.Tokens.AccessToken)
+		accountID := strings.TrimSpace(auth.Tokens.AccountID)
+		if accessToken == "" || accountID == "" {
+			return quotaCredentials{}, errors.New("auth.json 中 ChatGPT access_token 或 account_id 缺失")
+		}
+		return quotaCredentials{Mode: authModeChatGPT, AccessToken: accessToken, AccountID: accountID}, nil
+	default:
+		return quotaCredentials{}, errors.New("auth.json 中 auth_mode 不受支持")
+	}
 }
 
 func readDownstreamAPIKey() (string, error) {
-	home, err := os.UserHomeDir()
+	credentials, err := readQuotaCredentials()
 	if err != nil {
 		return "", err
 	}
-	authBytes, err := os.ReadFile(filepath.Join(home, authRelPath))
-	if err != nil {
-		return "", fmt.Errorf("读取 Codex 凭据失败：%w", err)
+	if credentials.Mode != authModeAPIKey {
+		return "", errors.New("当前 auth_mode 不支持 CPA API Key 重置接口")
 	}
-	var auth map[string]json.RawMessage
-	if err := json.Unmarshal(authBytes, &auth); err != nil {
-		return "", fmt.Errorf("解析 Codex 凭据失败：%w", err)
-	}
-	var apiKey string
-	if err := json.Unmarshal(auth["OPENAI_API_KEY"], &apiKey); err != nil || apiKey == "" {
-		return "", errors.New("auth.json 中未找到 OPENAI_API_KEY")
-	}
-	return apiKey, nil
+	return credentials.APIKey, nil
 }
 
 func requestQuotaReset() (string, error) {

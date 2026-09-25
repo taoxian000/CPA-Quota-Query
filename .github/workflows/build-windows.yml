@@ -25,7 +25,7 @@ jobs:
         run: go test ./...
 
       - name: Build Windows AMD64 executable
-        run: go build -trimpath "-ldflags=-H=windowsgui -X main.appVersion=$env:APP_VERSION" -o quota-monitor-windows-amd64.exe .
+        run: go build -trimpath "-ldflags=-H=windowsgui -X main.appVersion=$env:APP_VERSION" -o "quota-monitor-$($env:APP_VERSION).exe" .
         env:
           GOOS: windows
           GOARCH: amd64
@@ -34,8 +34,8 @@ jobs:
       - name: Upload executable
         uses: actions/upload-artifact@v7
         with:
-          name: quota-monitor-windows-amd64-${{ github.ref_name }}
-          path: quota-monitor-windows-amd64.exe
+          name: quota-monitor-${{ github.ref_name }}
+          path: quota-monitor-${{ github.ref_name }}.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -51,7 +51,7 @@ jobs:
           }
           gh release view $env:APP_VERSION *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:APP_VERSION .\quota-monitor-windows-amd64.exe --clobber
+            gh release upload $env:APP_VERSION ".\quota-monitor-$($env:APP_VERSION).exe" --clobber
           } else {
-            gh release create $env:APP_VERSION .\quota-monitor-windows-amd64.exe --verify-tag --generate-notes --title $env:APP_VERSION
+            gh release create $env:APP_VERSION ".\quota-monitor-$($env:APP_VERSION).exe" --verify-tag --generate-notes --title $env:APP_VERSION
           }

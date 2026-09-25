@@ -24,14 +24,14 @@ import (
 )
 
 const (
-	latestReleaseURL = "https://api.github.com/repos/taoxian000/CPA-Quota-Query/releases/latest"
-	updateAssetName  = "quota-monitor-windows-amd64.exe"
-	maxUpdateBytes   = 64 << 20
-	updateCheckEvery = 24 * time.Hour
+	latestReleaseURL      = "https://api.github.com/repos/taoxian000/CPA-Quota-Query/releases/latest"
+	legacyUpdateAssetName = "quota-monitor-windows-amd64.exe"
+	maxUpdateBytes        = 64 << 20
+	updateCheckEvery      = 24 * time.Hour
 )
 
 var (
-	appVersion       = "v1.1"
+	appVersion       = "v1.2"
 	procShellExecute = shell32.NewProc("ShellExecuteW")
 	errNoRelease     = errors.New("尚无正式 Release")
 )
@@ -153,9 +153,10 @@ func selectReleaseAsset(release githubRelease) (updateRelease, error) {
 	if _, err := parseVersion(release.TagName); err != nil {
 		return updateRelease{}, fmt.Errorf("Release 版本号无效：%w", err)
 	}
+	versionedName := versionedUpdateAssetName(release.TagName)
 	var asset *releaseAsset
 	for i := range release.Assets {
-		if release.Assets[i].Name == updateAssetName {
+		if release.Assets[i].Name == versionedName {
 			if asset != nil {
 				return updateRelease{}, errors.New("Release 中存在重复的 Windows 程序附件")
 			}
@@ -163,7 +164,17 @@ func selectReleaseAsset(release githubRelease) (updateRelease, error) {
 		}
 	}
 	if asset == nil {
-		return updateRelease{}, fmt.Errorf("Release 缺少附件 %s", updateAssetName)
+		for i := range release.Assets {
+			if release.Assets[i].Name == legacyUpdateAssetName {
+				if asset != nil {
+					return updateRelease{}, errors.New("Release 中存在重复的 Windows 程序附件")
+				}
+				asset = &release.Assets[i]
+			}
+		}
+	}
+	if asset == nil {
+		return updateRelease{}, fmt.Errorf("Release 缺少附件 %s", versionedName)
 	}
 	parsedURL, err := url.Parse(asset.BrowserDownloadURL)
 	if err != nil || parsedURL.Scheme != "https" || !strings.EqualFold(parsedURL.Hostname(), "github.com") {
@@ -177,6 +188,10 @@ func selectReleaseAsset(release githubRelease) (updateRelease, error) {
 		return updateRelease{}, err
 	}
 	return updateRelease{Tag: release.TagName, URL: parsedURL.String(), Digest: digest, Size: asset.Size}, nil
+}
+
+func versionedUpdateAssetName(tag string) string {
+	return "quota-monitor-" + tag + ".exe"
 }
 
 func parseSHA256Digest(value string) (string, error) {
