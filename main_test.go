@@ -268,8 +268,8 @@ func TestFetchQuotaUsingAuthRoutesByMode(t *testing.T) {
 			if got.Nominal.Email != tt.wantEmail || got.DirectMode != tt.wantDirect {
 				t.Fatalf("routed quota result did not match expected account or mode")
 			}
-			if got.ResetSupported == tt.wantDirect {
-				t.Fatalf("ResetSupported = %v for direct mode %v", got.ResetSupported, tt.wantDirect)
+			if !got.ResetSupported {
+				t.Fatalf("quota reset should be supported for direct mode %v", tt.wantDirect)
 			}
 			if tt.wantDirect && (got.Nominal.Primary.Percent != 65 || got.Nominal.Reset.AvailableCount != 2 || got.ActualAvailable || !got.SingleAccount || !got.NominalAvailable) {
 				t.Fatal("direct response quota or reset-credit data was not parsed correctly")
@@ -294,6 +294,55 @@ func TestTrayAccountUsesDirectChatGPTQuota(t *testing.T) {
 	got = trayAccount(quotaSnapshot{Nominal: chatGPTAccount, Actual: actualAccount, NominalAvailable: true, ActualAvailable: true})
 	if got.Email != actualAccount.Email || got.Primary.Percent != actualAccount.Primary.Percent {
 		t.Fatal("tray icon did not prefer actual-account quota in API-key mode")
+	}
+}
+
+func TestRequestQuotaResetRoutesByAuthMode(t *testing.T) {
+	calls := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		calls[r.URL.Path]++
+		if r.Method != http.MethodGet {
+			t.Error("quota reset request method was incorrect")
+		}
+		switch r.URL.Path {
+		case "/reset":
+			if r.Header.Get("Authorization") != "Bearer cpa-key" {
+				t.Error("API-key reset request used an incorrect authorization header")
+			}
+			_, _ = w.Write([]byte(`{"success":true,"nominal_accounts":{"api@example.test":{"success":true,"message":"Codex quota reset credit consumed"}}}`))
+		case "/direct/reset":
+			if r.Header.Get("Authorization") != "Bearer access-token" || r.Header.Get("ChatGPT-Account-ID") != "account-uuid" || r.Header.Get("User-Agent") != "QuotaTrayMonitor/1.0" {
+				t.Error("direct reset request headers did not match the direct quota request")
+			}
+			_, _ = w.Write([]byte(`{"success":true,"accounts":{"direct@example.test":{"success":true,"message":"Codex quota reset credit consumed"}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name        string
+		credentials quotaCredentials
+		wantEmail   string
+	}{
+		{name: "apikey", credentials: quotaCredentials{Mode: authModeAPIKey, APIKey: "cpa-key"}, wantEmail: "api@example.test"},
+		{name: "chatgpt", credentials: quotaCredentials{Mode: authModeChatGPT, AccessToken: "access-token", AccountID: "account-uuid"}, wantEmail: "direct@example.test"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := requestQuotaResetWithAuth(server.Client(), tt.credentials, server.URL+"/reset", server.URL+"/direct/reset")
+			if err != nil {
+				t.Fatalf("requestQuotaResetWithAuth() error = %v", err)
+			}
+			if !strings.Contains(got, tt.wantEmail+"：成功") {
+				t.Fatalf("reset response did not include success for the expected account")
+			}
+		})
+	}
+	if calls["/reset"] != 1 || calls["/direct/reset"] != 1 {
+		t.Fatalf("reset endpoints called counts = %#v, want one call each (no retries)", calls)
 	}
 }
 
@@ -345,14 +394,24 @@ func TestAuthBackupSelectsQuotaRouteWithoutExposingCredentials(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if credentials.Mode == authModeChatGPT {
-			if r.URL.Path != "/direct" || r.Header.Get("Authorization") != "Bearer "+credentials.AccessToken || r.Header.Get("ChatGPT-Account-ID") != credentials.AccountID {
+			if (r.URL.Path != "/direct" && r.URL.Path != "/direct/reset") ||
+				r.Header.Get("Authorization") != "Bearer "+credentials.AccessToken ||
+				r.Header.Get("ChatGPT-Account-ID") != credentials.AccountID {
 				t.Error("auth.bak credentials were not routed to the direct endpoint correctly")
+			}
+			if r.URL.Path == "/direct/reset" {
+				_, _ = w.Write([]byte(`{"success":true,"accounts":{"fixture@example.test":{"success":true}}}`))
+				return
 			}
 			_, _ = w.Write([]byte(`{"accounts":{"fixture@example.test":{"groups":[]}}}`))
 			return
 		}
-		if r.URL.Path != "/apikey" || r.Header.Get("Authorization") != "Bearer "+credentials.APIKey {
+		if (r.URL.Path != "/apikey" && r.URL.Path != "/reset") || r.Header.Get("Authorization") != "Bearer "+credentials.APIKey {
 			t.Error("auth.bak API key was not routed to the original endpoint correctly")
+		}
+		if r.URL.Path == "/reset" {
+			_, _ = w.Write([]byte(`{"success":true,"nominal_accounts":{"fixture@example.test":{"success":true}}}`))
+			return
 		}
 		_, _ = w.Write([]byte(`{"nominal_accounts":{"fixture@example.test":{"groups":[]}}}`))
 	}))
@@ -364,6 +423,10 @@ func TestAuthBackupSelectsQuotaRouteWithoutExposingCredentials(t *testing.T) {
 	}
 	if got.DirectMode != (credentials.Mode == authModeChatGPT) || got.Nominal.Email != "fixture@example.test" {
 		t.Fatal("auth.bak fixture selected an unexpected quota route")
+	}
+	resetResult, err := requestQuotaResetWithAuth(server.Client(), credentials, server.URL+"/reset", server.URL+"/direct/reset")
+	if err != nil || !strings.Contains(resetResult, "fixture@example.test：成功") {
+		t.Fatal("auth.bak fixture did not route reset through the local mock correctly")
 	}
 }
 

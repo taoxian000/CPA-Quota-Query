@@ -31,7 +31,7 @@ const (
 )
 
 var (
-	appVersion       = "v1.2"
+	appVersion       = "v1.3"
 	procShellExecute = shell32.NewProc("ShellExecuteW")
 	errNoRelease     = errors.New("尚无正式 Release")
 )

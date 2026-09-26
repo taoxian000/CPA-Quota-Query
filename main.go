@@ -28,6 +28,7 @@ const (
 	apiURL              = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota"
 	directAPIURL        = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota/direct"
 	resetAPIURL         = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota/reset"
+	directResetAPIURL   = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota/direct/reset"
 	authRelPath         = ".codex\\auth.json"
 	authModeAPIKey      = "apikey"
 	authModeChatGPT     = "chatgpt"
@@ -1081,7 +1082,7 @@ func (a *monitorApp) resetQuota() {
 	}
 	snapshot := a.snapshot()
 	if !snapshot.quota.ResetSupported {
-		showMessageBox(a.panelWindow, "当前认证方式仅支持查询额度，不支持此重置操作。", mbOK|mbIconInformation)
+		showMessageBox(a.panelWindow, "当前认证方式不支持此重置操作。", mbOK|mbIconInformation)
 		return
 	}
 	if snapshot.quota.Nominal.Reset.AvailableCount < 1 {
@@ -1092,6 +1093,12 @@ func (a *monitorApp) resetQuota() {
 		"即将为名义账户 %s 消耗 1 次可用重置额度。\n\n服务端会对该 API Key 对应名义前缀下的每个账户最多消耗 1 次；你已说明当前服务端配置为单账号。\n\n重置可能无法撤销，是否继续？",
 		accountEmail(snapshot.quota.Nominal),
 	)
+	if snapshot.quota.DirectMode {
+		confirmation = fmt.Sprintf(
+			"即将使用当前 Codex 认证为账户 %s 消耗 1 次可用重置额度。\n\n该操作会直接请求插件的账户重置接口，可能无法撤销；请求不会自动重试。是否继续？",
+			accountEmail(snapshot.quota.Nominal),
+		)
+	}
 	if showMessageBox(a.panelWindow, confirmation, mbYesNo|mbIconWarning|mbDefaultButton2) != idYes {
 		return
 	}
@@ -1606,6 +1613,13 @@ type quotaResetResponse struct {
 	Errors          []string                           `json:"errors"`
 }
 
+type quotaDirectResetResponse struct {
+	Success  bool                               `json:"success"`
+	Partial  bool                               `json:"partial"`
+	Accounts map[string]quotaResetAccountResult `json:"accounts"`
+	Errors   []string                           `json:"errors"`
+}
+
 type quotaResetAccountResult struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
@@ -1702,9 +1716,7 @@ func fetchDirectQuotaAt(client *http.Client, endpoint, accessToken, accountID st
 	if err != nil {
 		return quotaSnapshot{}, err
 	}
-	req.Header.Set("User-Agent", "QuotaTrayMonitor/1.0")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("ChatGPT-Account-ID", accountID)
+	setDirectQuotaHeaders(req, accessToken, accountID)
 	resp, err := client.Do(req)
 	if err != nil {
 		return quotaSnapshot{}, fmt.Errorf("直接额度接口请求失败：%w", err)
@@ -1746,7 +1758,14 @@ func parseDirectQuotaEnvelope(envelope directResponseEnvelope) (quotaSnapshot, e
 		NominalAvailable: true,
 		SingleAccount:    len(envelope.Accounts) == 1,
 		DirectMode:       true,
+		ResetSupported:   true,
 	}, nil
+}
+
+func setDirectQuotaHeaders(req *http.Request, accessToken, accountID string) {
+	req.Header.Set("User-Agent", "QuotaTrayMonitor/1.0")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("ChatGPT-Account-ID", accountID)
 }
 
 func hasActualAccounts(raw json.RawMessage) bool {
@@ -1836,16 +1855,10 @@ func readDownstreamAPIKey() (string, error) {
 }
 
 func requestQuotaReset() (string, error) {
-	apiKey, err := readDownstreamAPIKey()
+	credentials, err := readQuotaCredentials()
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequest(http.MethodGet, resetAPIURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "QuotaTrayMonitor/1.0")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
 	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
 		return "", errors.New("无法创建单次重置请求")
@@ -1861,6 +1874,37 @@ func requestQuotaReset() (string, error) {
 			return http.ErrUseLastResponse
 		},
 	}
+	return requestQuotaResetWithAuth(client, credentials, resetAPIURL, directResetAPIURL)
+}
+
+func requestQuotaResetWithAuth(client *http.Client, credentials quotaCredentials, apiKeyEndpoint, chatGPTEndpoint string) (string, error) {
+	endpoint := apiKeyEndpoint
+	directMode := false
+	var req *http.Request
+	var err error
+	switch credentials.Mode {
+	case authModeAPIKey:
+		req, err = http.NewRequest(http.MethodGet, endpoint, nil)
+		if err == nil {
+			req.Header.Set("User-Agent", "QuotaTrayMonitor/1.0")
+			req.Header.Set("Authorization", "Bearer "+credentials.APIKey)
+		}
+	case authModeChatGPT:
+		endpoint = chatGPTEndpoint
+		directMode = true
+		req, err = http.NewRequest(http.MethodGet, endpoint, nil)
+		if err == nil {
+			setDirectQuotaHeaders(req, credentials.AccessToken, credentials.AccountID)
+		}
+	default:
+		return "", errors.New("auth.json 中 auth_mode 不受支持")
+	}
+	if err != nil {
+		return "", err
+	}
+	if client == nil {
+		return "", errors.New("无法创建单次重置请求")
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", errors.New("网络连接失败，无法判断服务端是否已消费额度")
@@ -1868,6 +1912,18 @@ func requestQuotaReset() (string, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("服务端返回 HTTP %d，无法确认重置结果", resp.StatusCode)
+	}
+	if directMode {
+		var result quotaDirectResetResponse
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
+			return "", errors.New("服务端已响应，但结果无法解析；无法确认是否已消费额度")
+		}
+		return formatQuotaResetResponse(quotaResetResponse{
+			Success:         result.Success,
+			Partial:         result.Partial,
+			NominalAccounts: result.Accounts,
+			Errors:          result.Errors,
+		}), nil
 	}
 	var result quotaResetResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&result); err != nil {
