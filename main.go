@@ -352,6 +352,7 @@ type monitorApp struct {
 	checkingUpdate   atomic.Bool
 	installingUpdate atomic.Bool
 	intervalChange   chan time.Duration
+	quotaChanged     chan struct{}
 	panelButton      string
 	menuOpen         bool
 }
@@ -378,7 +379,11 @@ func run() error {
 		return nil
 	}
 
-	app := &monitorApp{mutex: syscall.Handle(mutex), intervalChange: make(chan time.Duration, 1)}
+	app := &monitorApp{
+		mutex:          syscall.Handle(mutex),
+		intervalChange: make(chan time.Duration, 1),
+		quotaChanged:   make(chan struct{}, 1),
+	}
 	currentApp = app
 	app.state.settings = loadSettings()
 	app.state.startup = startupEnabled()
@@ -447,6 +452,7 @@ func run() error {
 	}
 	app.startFetch()
 	go app.refreshLoop()
+	go app.quotaExpiryLoop()
 	go app.updateCheckLoop()
 	return app.messageLoop()
 }
@@ -518,10 +524,11 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 			}
 		case wmStateChanged:
 			a.updateTray()
-			if a.panelVisible {
-				a.resizePanel()
-				procInvalidateRect.Call(uintptr(a.panelWindow), 0, 1)
-			}
+			// Quota refreshes can add or remove the actual-account card. Keep
+			// the hidden window's geometry current too, then repaint immediately
+			// if it is visible; showPanel also uses this latest snapshot.
+			a.resizePanel()
+			procInvalidateRect.Call(uintptr(a.panelWindow), 0, 1)
 			return 0
 		case wmResetCompleted:
 			a.state.mu.Lock()
@@ -608,7 +615,13 @@ func (a *monitorApp) startFetch() {
 	a.state.status = "正在刷新额度…"
 	a.state.mu.Unlock()
 	go func() {
-		defer a.fetching.Store(false)
+		defer func() {
+			a.fetching.Store(false)
+			select {
+			case a.quotaChanged <- struct{}{}:
+			default:
+			}
+		}()
 		quota, err := fetchQuota()
 		a.state.mu.Lock()
 		if err != nil {
@@ -640,6 +653,38 @@ func (a *monitorApp) refreshLoop() {
 				}
 			}
 			timer.Reset(interval)
+		}
+	}
+}
+
+func (a *monitorApp) quotaExpiryLoop() {
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	var handledThrough time.Time
+	for {
+		select {
+		case <-a.quotaChanged:
+			if timer != nil && !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			now := time.Now()
+			next, expired := nextQuotaExpiry(a.snapshot().quota, now, handledThrough)
+			if expired {
+				timer = time.NewTimer(0)
+				timerC = timer.C
+			} else if !next.IsZero() {
+				timer = time.NewTimer(time.Until(next))
+				timerC = timer.C
+			} else {
+				timerC = nil
+			}
+		case <-timerC:
+			timerC = nil
+			handledThrough = time.Now()
+			a.startFetch()
 		}
 	}
 }
@@ -772,7 +817,7 @@ func (a *monitorApp) showPanel() {
 }
 
 func (a *monitorApp) resizePanel() {
-	if a.panelWindow == 0 || !a.panelVisible {
+	if a.panelWindow == 0 {
 		return
 	}
 	bounds := rect{}
@@ -2088,6 +2133,33 @@ func quotaRemainingText(bucket quotaBucket, now time.Time) string {
 	}
 	minutes := int(remaining.Minutes()) % 60
 	return fmt.Sprintf("剩余时间：%d小时%d分", hours, minutes)
+}
+
+func nextQuotaExpiry(quota quotaSnapshot, now, handledThrough time.Time) (time.Time, bool) {
+	var next time.Time
+	expired := false
+	consider := func(at time.Time) {
+		if at.IsZero() || (!handledThrough.IsZero() && !at.After(handledThrough)) {
+			return
+		}
+		if !at.After(now) {
+			expired = true
+			return
+		}
+		if next.IsZero() || at.Before(next) {
+			next = at
+		}
+	}
+	consider(quota.Nominal.Primary.ResetAt)
+	consider(quota.Nominal.Secondary.ResetAt)
+	consider(quota.Actual.Primary.ResetAt)
+	consider(quota.Actual.Secondary.ResetAt)
+	for _, info := range []resetCreditInfo{quota.Nominal.Reset, quota.Actual.Reset} {
+		for _, raw := range info.ExpiresAt {
+			consider(parseQuotaResetTime(raw))
+		}
+	}
+	return next, expired
 }
 
 func shortError(s string) string {

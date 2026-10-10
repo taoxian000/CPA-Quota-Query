@@ -488,6 +488,29 @@ func TestPanelHeightOmitsActualCardWhenFieldIsMissing(t *testing.T) {
 	}
 }
 
+func TestQuotaRefreshAddsActualAccountCardToSnapshot(t *testing.T) {
+	var initial responseEnvelope
+	if err := json.Unmarshal([]byte(`{"nominal_accounts":{"nominal@example.test":{"groups":[]}}}`), &initial); err != nil {
+		t.Fatal(err)
+	}
+	opened := parseQuotaEnvelope(initial)
+	if opened.ActualAvailable {
+		t.Fatal("actual-account card should be hidden when the server omits actual_accounts")
+	}
+
+	var refreshed responseEnvelope
+	if err := json.Unmarshal([]byte(`{"nominal_accounts":{"nominal@example.test":{"groups":[]}},"actual_accounts":{"actual@example.test":{"groups":[]}}}`), &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	afterRefresh := parseQuotaEnvelope(refreshed)
+	if !afterRefresh.ActualAvailable {
+		t.Fatal("actual-account card should appear when a refreshed response contains actual_accounts")
+	}
+	if panelHeightFor(afterRefresh) <= panelHeightFor(opened) {
+		t.Fatal("window height should grow after refresh adds the actual-account card")
+	}
+}
+
 func TestQuotaRemainingTextFormatsHoursDaysAndMinutes(t *testing.T) {
 	now := time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -508,6 +531,46 @@ func TestQuotaRemainingTextFormatsHoursDaysAndMinutes(t *testing.T) {
 				t.Fatalf("quotaRemainingText() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNextQuotaExpiryFindsEarliestQuotaOrResetCreditExpiry(t *testing.T) {
+	now := time.Date(2026, 10, 10, 10, 0, 0, 0, time.UTC)
+	quota := quotaSnapshot{
+		Nominal: accountQuota{
+			Primary:   quotaBucket{ResetAt: now.Add(3 * time.Hour)},
+			Secondary: quotaBucket{ResetAt: now.Add(time.Hour)},
+			Reset:     resetCreditInfo{ExpiresAt: []string{now.Add(30 * time.Minute).Format(time.RFC3339)}},
+		},
+		Actual: accountQuota{
+			Primary: quotaBucket{ResetAt: now.Add(2 * time.Hour)},
+		},
+	}
+
+	next, expired := nextQuotaExpiry(quota, now, time.Time{})
+	if expired {
+		t.Fatal("future quota expiries should not be considered expired")
+	}
+	if want := now.Add(30 * time.Minute); !next.Equal(want) {
+		t.Fatalf("next quota expiry = %v, want earliest expiry %v", next, want)
+	}
+}
+
+func TestNextQuotaExpiryRequestsRefreshOnceAnyExpiryHasPassed(t *testing.T) {
+	now := time.Date(2026, 10, 10, 10, 0, 0, 0, time.UTC)
+	quota := quotaSnapshot{
+		Nominal: accountQuota{Primary: quotaBucket{ResetAt: now.Add(-time.Second)}},
+		Actual:  accountQuota{Secondary: quotaBucket{ResetAt: now.Add(time.Hour)}},
+	}
+	if _, expired := nextQuotaExpiry(quota, now, time.Time{}); !expired {
+		t.Fatal("an expired quota bucket should request an immediate refresh")
+	}
+	next, expired := nextQuotaExpiry(quota, now, now)
+	if expired {
+		t.Fatal("an expiry already handled by the forced refresh should not trigger again")
+	}
+	if want := now.Add(time.Hour); !next.Equal(want) {
+		t.Fatalf("next unhandled expiry = %v, want %v", next, want)
 	}
 }
 
