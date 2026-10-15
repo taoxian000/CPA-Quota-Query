@@ -31,7 +31,8 @@ const (
 )
 
 var (
-	appVersion       = "v1.3"
+	// appVersion is overridden at build time with -X main.appVersion=<tag>.
+	appVersion       = "v1.5"
 	procShellExecute = shell32.NewProc("ShellExecuteW")
 	errNoRelease     = errors.New("尚无正式 Release")
 )
@@ -66,58 +67,71 @@ func (a *monitorApp) updateCheckLoop() {
 	}
 }
 
+// newUpdateClient follows GitHub's redirects to its asset hosts but refuses a
+// redirect that changes the URL scheme (for example HTTPS to HTTP).
+func newUpdateClient(timeout time.Duration, operation string) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(request *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New(operation + "重定向次数过多")
+			}
+			if len(via) > 0 && request.URL.Scheme != via[len(via)-1].URL.Scheme {
+				return errors.New("拒绝不安全的" + operation + "重定向")
+			}
+			return nil
+		},
+	}
+}
+
+// checkForUpdate runs the GitHub release check. Manual checks report every
+// outcome in a message box; the automatic daily check only updates the status
+// line, since a failure there (e.g. no network yet at logon) needs no action.
 func (a *monitorApp) checkForUpdate(manual bool) {
+	if manual {
+		a.manualUpdateCheck.Store(true)
+	}
 	if !a.checkingUpdate.CompareAndSwap(false, true) {
 		return
 	}
 	a.state.mu.Lock()
-	a.state.updateChecking = true
 	a.state.updateStatus = "正在检查更新…"
 	a.state.mu.Unlock()
 	procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
 
 	go func() {
 		defer a.checkingUpdate.Store(false)
-		client := &http.Client{
-			Timeout: 20 * time.Second,
-			CheckRedirect: func(request *http.Request, via []*http.Request) error {
-				if len(via) >= 5 {
-					return errors.New("更新检查重定向次数过多")
-				}
-				if len(via) > 0 && request.URL.Scheme != via[len(via)-1].URL.Scheme {
-					return errors.New("拒绝不安全的更新检查重定向")
-				}
-				return nil
-			},
+		release, err := fetchLatestRelease(newUpdateClient(20*time.Second, "更新检查"), latestReleaseURL)
+		comparison := 0
+		if err == nil {
+			comparison, err = compareVersions(release.Tag, appVersion)
 		}
-		release, err := fetchLatestRelease(client, latestReleaseURL)
+		manual := a.manualUpdateCheck.Swap(false)
+		alert, alertFlags := "", uintptr(mbIconInformation)
 		a.state.mu.Lock()
-		a.state.updateChecking = false
-		if err != nil {
-			if errors.Is(err, errNoRelease) {
-				a.state.updateStatus = ""
-			} else {
-				a.state.updateStatus = "检查更新失败：" + shortError(err.Error())
-			}
-		} else {
-			comparison, compareErr := compareVersions(release.Tag, appVersion)
-			if compareErr != nil {
-				a.state.updateStatus = "检查更新失败：" + shortError(compareErr.Error())
-			} else {
-				a.state.updateAvailable = comparison > 0
-				a.state.updateStatus = ""
-				if a.state.updateAvailable {
-					a.state.updateRelease = release
-				} else {
-					a.state.updateRelease = updateRelease{}
-					if manual {
-						a.state.updateStatus = "当前已是最新版本"
-					}
-				}
-			}
+		switch {
+		case errors.Is(err, errNoRelease):
+			a.state.updateStatus = ""
+			alert = "GitHub 上还没有正式 Release。"
+		case err != nil:
+			a.state.updateStatus = "检查更新失败：" + shortError(err.Error())
+			alert, alertFlags = "检查更新失败。\n\n"+err.Error(), mbIconWarning
+		case comparison > 0:
+			a.state.updateAvailable = true
+			a.state.updateRelease = release
+			a.state.updateStatus = ""
+			alert = fmt.Sprintf("发现新版本 %s（当前 %s）。\n\n可点击面板顶部或托盘菜单中的“更新到 %s”进行安装。", release.Tag, appVersion, release.Tag)
+		default:
+			a.state.updateAvailable = false
+			a.state.updateRelease = updateRelease{}
+			a.state.updateStatus = ""
+			alert = "当前已是最新版本（" + appVersion + "）。"
 		}
 		a.state.mu.Unlock()
 		procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
+		if manual {
+			a.queueAlert(alert, alertFlags)
+		}
 	}()
 }
 
@@ -327,26 +341,14 @@ func (a *monitorApp) installUpdate() {
 	procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
 
 	go func(release updateRelease) {
-		client := &http.Client{
-			Timeout: 2 * time.Minute,
-			CheckRedirect: func(request *http.Request, via []*http.Request) error {
-				if len(via) >= 5 {
-					return errors.New("更新下载重定向次数过多")
-				}
-				if len(via) > 0 && request.URL.Scheme != via[len(via)-1].URL.Scheme {
-					return errors.New("拒绝不安全的更新下载重定向")
-				}
-				return nil
-			},
-		}
-		temporary, err := downloadAndVerify(client, release)
+		temporary, err := downloadAndVerify(newUpdateClient(2*time.Minute, "更新下载"), release)
 		if err != nil {
 			a.finishUpdateError(err)
 			return
 		}
 		executable, err := os.Executable()
 		if err == nil {
-			err = launchUpdateHelper(executable, temporary, os.Getpid())
+			err = launchUpdateHelper(executable, temporary, release.Digest, os.Getpid())
 		}
 		if err != nil {
 			_ = os.Remove(temporary)
@@ -367,9 +369,10 @@ func (a *monitorApp) finishUpdateError(err error) {
 	a.state.updateStatus = "更新失败：" + shortError(err.Error())
 	a.state.mu.Unlock()
 	procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
+	a.queueAlert("更新失败，程序未被修改。\n\n"+err.Error(), mbIconWarning)
 }
 
-func launchUpdateHelper(target, download string, processID int) error {
+func launchUpdateHelper(target, download, digest string, processID int) error {
 	target, err := filepath.Abs(target)
 	if err != nil {
 		return err
@@ -386,7 +389,7 @@ func launchUpdateHelper(target, download string, processID int) error {
 	if err != nil {
 		return errors.New("找不到 Windows PowerShell，无法完成程序替换")
 	}
-	encoded := encodePowerShellCommand(updateHelperScript(target, download, processID))
+	encoded := encodePowerShellCommand(updateHelperScript(target, download, digest, processID))
 	arguments := []string{"-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded}
 
 	if permissionErr == nil {
@@ -432,7 +435,9 @@ func startElevatedPowerShell(executable string, arguments []string, workingDirec
 		uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(file)), uintptr(unsafe.Pointer(params)),
 		uintptr(unsafe.Pointer(directory)), swHide)
 	if result <= 32 {
-		if result == 1223 {
+		// ShellExecute reports a declined UAC prompt as SE_ERR_ACCESSDENIED
+		// with ERROR_CANCELLED as the thread's last error.
+		if callErr == syscall.Errno(errorCancelled) {
 			return errors.New("用户取消了管理员权限请求，程序未更新")
 		}
 		if callErr != syscall.Errno(0) {
@@ -443,23 +448,27 @@ func startElevatedPowerShell(executable string, arguments []string, workingDirec
 	return nil
 }
 
-func updateHelperScript(target, download string, processID int) string {
-	targetLiteral := powershellLiteral(target)
-	downloadLiteral := powershellLiteral(download)
-	markerLiteral := powershellLiteral(updateFailureMarker(target))
+// updateHelperScript waits for this process to exit, then swaps in the new
+// executable. The SHA-256 is checked again on the staged copy inside the
+// install directory, so a file swapped in %TEMP% after the download check can
+// never be installed (this matters when the helper runs elevated).
+func updateHelperScript(target, download, digest string, processID int) string {
 	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'
 $target = %s
 $download = %s
 $marker = %s
+$expected = %s
+$staging = $target + '.update-new'
+$backup = $target + '.update-backup'
 $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 try {
   Wait-Process -Id %d -ErrorAction SilentlyContinue
   Start-Sleep -Milliseconds 400
-  $staging = $target + '.update-new'
-  $backup = $target + '.update-backup'
   if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Force }
   if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
   Copy-Item -LiteralPath $download -Destination $staging -Force
+  $actual = (Get-FileHash -LiteralPath $staging -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) { throw '更新文件 SHA-256 校验失败' }
   [System.IO.File]::Replace($staging, $target, $backup, $true)
   if ($elevated) {
     Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList ('"' + $target + '"')
@@ -470,13 +479,16 @@ try {
   Remove-Item -LiteralPath $backup -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
 } catch {
+  $failure = $_.Exception.Message
   if (Test-Path -LiteralPath $backup) {
     try {
       if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
       Move-Item -LiteralPath $backup -Destination $target -Force
     } catch {}
   }
-  try { Set-Content -LiteralPath $marker -Value '更新安装失败，请检查目录权限后重试。' -Encoding UTF8 }
+  Remove-Item -LiteralPath $staging -Force -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
+  try { Set-Content -LiteralPath $marker -Value ('更新安装失败，请检查目录权限后重试。' + [Environment]::NewLine + $failure) -Encoding UTF8 }
   catch {}
   if (Test-Path -LiteralPath $target) {
     if ($elevated) {
@@ -486,11 +498,16 @@ try {
     }
   }
 }
-`, targetLiteral, downloadLiteral, markerLiteral, processID)
+`, powershellString(target), powershellString(download), powershellString(updateFailureMarker(target)), powershellString(digest), processID)
 }
 
-func powershellLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+// powershellString returns a PowerShell expression that evaluates to value.
+// The text travels as Base64, so no character in a path can terminate the
+// literal; PowerShell also treats the typographic quotes ‘ ’ ‚ ‛ as string
+// delimiters, which doubling the ASCII quote does not cover.
+func powershellString(value string) string {
+	encoded := base64.StdEncoding.EncodeToString([]byte(value))
+	return "[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('" + encoded + "'))"
 }
 
 func encodePowerShellCommand(script string) string {

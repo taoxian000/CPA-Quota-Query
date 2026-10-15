@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,40 +27,42 @@ import (
 )
 
 const (
-	apiURL              = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota"
-	directAPIURL        = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota/direct"
-	resetAPIURL         = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota/reset"
-	directResetAPIURL   = "https://kot.xkcht.eu.org/v0/resource/plugins/user-routing/quota/direct/reset"
-	authRelPath         = ".codex\\auth.json"
-	authModeAPIKey      = "apikey"
-	authModeChatGPT     = "chatgpt"
-	quotaRequestRetries = 5
+	defaultServerURL      = "https://kot.xkcht.eu.org"
+	quotaRoutePath        = "/v0/resource/plugins/user-routing/quota"
+	authRelPath           = ".codex\\auth.json"
+	authModeAPIKey        = "apikey"
+	authModeChatGPT       = "chatgpt"
+	quotaRequestRetries   = 5
+	maxQuotaResponseBytes = 4 << 20
 
 	classMain  = "QuotaTrayMonitorMainWindow"
 	classPanel = "QuotaTrayMonitorPanelWindow"
 	windowName = "Codex额度监控"
 
-	wmApp             = 0x8000
-	wmTray            = wmApp + 10
-	wmStateChanged    = wmApp + 11
-	wmResetCompleted  = wmApp + 12
-	wmActivate        = 0x0006
-	wmPaint           = 0x000F
-	wmClose           = 0x0010
-	wmEraseBackground = 0x0014
-	wmSettingChange   = 0x001A
-	wmThemeChanged    = 0x031A
-	wmCommand         = 0x0111
-	wmTimer           = 0x0113
-	wmLButtonDown     = 0x0201
-	wmExitSizeMove    = 0x0232
-	wmNCLButtonDown   = 0x00A1
-	wmNull            = 0x0000
-	wmLButtonUp       = 0x0202
-	wmRButtonUp       = 0x0205
-	wmContextMenu     = 0x007B
-	waInactive        = 0
-	htCaption         = 2
+	wmApp              = 0x8000
+	wmTray             = wmApp + 10
+	wmStateChanged     = wmApp + 11
+	wmResetCompleted   = wmApp + 12
+	wmShowAlert        = wmApp + 13
+	wmShowNotice       = wmApp + 14
+	wmShowPanelRequest = wmApp + 15
+	wmActivate         = 0x0006
+	wmPaint            = 0x000F
+	wmClose            = 0x0010
+	wmEraseBackground  = 0x0014
+	wmSettingChange    = 0x001A
+	wmThemeChanged     = 0x031A
+	wmCommand          = 0x0111
+	wmTimer            = 0x0113
+	wmLButtonDown      = 0x0201
+	wmExitSizeMove     = 0x0232
+	wmNCLButtonDown    = 0x00A1
+	wmNull             = 0x0000
+	wmLButtonUp        = 0x0202
+	wmRButtonUp        = 0x0205
+	wmContextMenu      = 0x007B
+	waInactive         = 0
+	htCaption          = 2
 
 	wsPopup          = 0x80000000
 	wsExToolWindow   = 0x00000080
@@ -76,10 +80,11 @@ const (
 	nimAdd            = 0
 	nimModify         = 1
 	nimDelete         = 2
-	nimSetVer         = 4
 	nifMessage        = 1
 	nifIcon           = 2
 	nifTip            = 4
+	nifInfo           = 0x10
+	niifInfo          = 1
 	iconID            = 1
 	menuRefresh       = 1001
 	menuOpenPanel     = 1002
@@ -95,14 +100,22 @@ const (
 
 	mbOK              = 0x00000000
 	mbYesNo           = 0x00000004
+	mbIconError       = 0x00000010
 	mbIconInformation = 0x00000040
 	mbIconWarning     = 0x00000030
 	mbDefaultButton2  = 0x00000100
+	mbSetForeground   = 0x00010000
+	mbTopmost         = 0x00040000
 	idYes             = 6
 
 	dibRGBColors        = 0
 	biRGB               = 0
 	monDefaultToNearest = 2
+	smCxSmIcon          = 49
+	logPixelsX          = 88
+	mmAnisotropic       = 8
+	idcArrow            = 32512
+	baseDPI             = 96
 	dtSingleLine        = 0x0020
 	dtVCenter           = 0x0004
 	dtCenter            = 0x0001
@@ -112,6 +125,10 @@ const (
 	hwndTopmost   = ^uintptr(0)
 	hwndNotopmost = ^uintptr(1)
 
+	// DPI_AWARENESS_CONTEXT_SYSTEM_AWARE is the pseudo-handle -2.
+	dpiAwarenessContextSystemAware = ^uintptr(1)
+	asfwAny                        = uintptr(^uint32(0))
+
 	hkeyCurrentUser    = 0x80000001
 	keySetValue        = 0x0002
 	keyQueryValue      = 0x0001
@@ -119,8 +136,15 @@ const (
 	regDword           = 4
 	errorFileNotFound  = 2
 	errorAlreadyExists = 183
+	errorCancelled     = 1223
 	panelTimerID       = 1
 	panelTimerInterval = 60_000
+	trayRetryTimerID   = 2
+	trayRetryInterval  = 3_000
+
+	// A tray click that lands within this window after the panel hid itself on
+	// deactivation is the click that caused the deactivation, not a new open.
+	trayToggleGrace = 500 * time.Millisecond
 )
 
 const (
@@ -193,6 +217,17 @@ var (
 	procRegDeleteValue         = advapi32.NewProc("RegDeleteValueW")
 	procRegQueryValueEx        = advapi32.NewProc("RegQueryValueExW")
 	procRegCloseKey            = advapi32.NewProc("RegCloseKey")
+	procInvalidateRect         = user32.NewProc("InvalidateRect")
+	procLoadCursor             = user32.NewProc("LoadCursorW")
+	procGetSystemMetrics       = user32.NewProc("GetSystemMetrics")
+	procFindWindow             = user32.NewProc("FindWindowW")
+	procAllowSetForeground     = user32.NewProc("AllowSetForegroundWindow")
+	procSetProcessDPIAware     = user32.NewProc("SetProcessDPIAware")
+	procSetProcessDpiAwareness = user32.NewProc("SetProcessDpiAwarenessContext")
+	procGetDeviceCaps          = gdi32.NewProc("GetDeviceCaps")
+	procSetMapMode             = gdi32.NewProc("SetMapMode")
+	procSetWindowExtEx         = gdi32.NewProc("SetWindowExtEx")
+	procSetViewportExtEx       = gdi32.NewProc("SetViewportExtEx")
 )
 
 type point struct {
@@ -247,6 +282,13 @@ type notifyIconData struct {
 	InfoFlags        uint32
 	GUID             [16]byte
 	BalloonIcon      syscall.Handle
+}
+
+type notifyIconIdentifier struct {
+	Size   uint32
+	Window syscall.Handle
+	ID     uint32
+	GUID   [16]byte
 }
 
 type bitmapInfoHeader struct {
@@ -304,14 +346,16 @@ type resetCreditInfo struct {
 	ExpiryDetailsComplete  bool     `json:"expiry_details_complete"`
 }
 
+// quotaSnapshot holds every account returned by the server, in response order.
 type quotaSnapshot struct {
-	Nominal          accountQuota
-	Actual           accountQuota
-	NominalAvailable bool
-	ActualAvailable  bool
-	SingleAccount    bool
-	DirectMode       bool
-	ResetSupported   bool
+	Nominal        []accountQuota
+	Actual         []accountQuota
+	DirectMode     bool
+	ResetSupported bool
+}
+
+func (q quotaSnapshot) singleAccount() bool {
+	return len(q.Nominal)+len(q.Actual) == 1
 }
 
 type appSettings struct {
@@ -321,6 +365,14 @@ type appSettings struct {
 	PanelY         int32
 	RefreshMinutes int
 	ThemeMode      string
+	// ServerURL is the CPA base URL (scheme + host, optional path prefix).
+	// Empty means defaultServerURL.
+	ServerURL string `json:",omitempty"`
+}
+
+type alertMessage struct {
+	text  string
+	flags uintptr
 }
 
 type appState struct {
@@ -332,29 +384,41 @@ type appState struct {
 	startup         bool
 	resetResult     string
 	updateStatus    string
-	updateChecking  bool
 	updateAvailable bool
 	updateRelease   updateRelease
+	fetchFailing    bool
+	alerts          []alertMessage
+	notices         []quotaRecoveryNotice
 }
 
 type monitorApp struct {
-	state            appState
-	mainWindow       syscall.Handle
-	panelWindow      syscall.Handle
-	instance         syscall.Handle
-	mutex            syscall.Handle
-	trayAdded        bool
-	panelVisible     bool
-	trayIcon         syscall.Handle
-	taskbarMsg       uint32
-	fetching         atomic.Bool
-	resetPending     atomic.Bool
-	checkingUpdate   atomic.Bool
-	installingUpdate atomic.Bool
-	intervalChange   chan time.Duration
-	quotaChanged     chan struct{}
-	panelButton      string
-	menuOpen         bool
+	state             appState
+	mainWindow        syscall.Handle
+	panelWindow       syscall.Handle
+	instance          syscall.Handle
+	mutex             syscall.Handle
+	dpi               int32
+	iconSize          int
+	trayAdded         bool
+	panelVisible      bool
+	trayIcon          syscall.Handle
+	taskbarMsg        uint32
+	fetching          atomic.Bool
+	manualRefresh     atomic.Bool
+	resetPending      atomic.Bool
+	checkingUpdate    atomic.Bool
+	manualUpdateCheck atomic.Bool
+	installingUpdate  atomic.Bool
+	intervalChange    chan time.Duration
+	quotaChanged      chan struct{}
+	panelButton       string
+	menuOpen          bool
+	modalDepth        int
+	alertOpen         bool
+	panelAutoHiddenAt time.Time
+	trayPressed       bool
+	trayPressHides    bool
+	closing           bool
 }
 
 var currentApp *monitorApp
@@ -368,19 +432,22 @@ func main() {
 func run() error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	enableDPIAwareness()
 
-	name, _ := syscall.UTF16PtrFromString("Local\\CodexQuotaTrayMonitor")
-	mutex, _, createErr := procCreateMutex.Call(0, 0, uintptr(unsafe.Pointer(name)))
+	mutex, _, createErr := procCreateMutex.Call(0, 0, uintptr(unsafe.Pointer(utf16Ptr("Local\\CodexQuotaTrayMonitor"))))
 	if mutex == 0 {
 		return errors.New("无法创建单实例互斥锁")
 	}
 	if createErr == syscall.Errno(errorAlreadyExists) {
 		procCloseHandle.Call(mutex)
+		showExistingInstance()
 		return nil
 	}
 
 	app := &monitorApp{
 		mutex:          syscall.Handle(mutex),
+		dpi:            systemDPI(),
+		iconSize:       trayIconSize(),
 		intervalChange: make(chan time.Duration, 1),
 		quotaChanged:   make(chan struct{}, 1),
 	}
@@ -388,8 +455,9 @@ func run() error {
 	app.state.settings = loadSettings()
 	app.state.startup = startupEnabled()
 	app.state.status = "等待首次同步"
+	updateFailure := ""
 	if executable, err := os.Executable(); err == nil {
-		app.state.updateStatus = consumeUpdateFailure(executable)
+		updateFailure = consumeUpdateFailure(executable)
 	}
 
 	instance, _, _ := procGetModuleHandle.Call(0)
@@ -398,17 +466,18 @@ func run() error {
 	}
 	app.instance = syscall.Handle(instance)
 
-	mainClass, _ := syscall.UTF16PtrFromString(classMain)
-	panelClass, _ := syscall.UTF16PtrFromString(classPanel)
+	mainClass := utf16Ptr(classMain)
+	panelClass := utf16Ptr(classPanel)
 	callback := syscall.NewCallback(windowProc)
-	if err := registerWindowClass(mainClass, app.instance, callback); err != nil {
+	cursor, _, _ := procLoadCursor.Call(0, idcArrow)
+	if err := registerWindowClass(mainClass, app.instance, callback, syscall.Handle(cursor)); err != nil {
 		return err
 	}
-	if err := registerWindowClass(panelClass, app.instance, callback); err != nil {
+	if err := registerWindowClass(panelClass, app.instance, callback, syscall.Handle(cursor)); err != nil {
 		return err
 	}
 
-	title, _ := syscall.UTF16PtrFromString(windowName)
+	title := utf16Ptr(windowName)
 	hwnd, _, _ := procCreateWindowEx.Call(
 		wsExToolWindow,
 		uintptr(unsafe.Pointer(mainClass)),
@@ -433,7 +502,7 @@ func run() error {
 		uintptr(unsafe.Pointer(panelClass)),
 		uintptr(unsafe.Pointer(title)),
 		wsPopup,
-		0, 0, panelWidth, uintptr(panelHeightFor(quotaSnapshot{})),
+		0, 0, uintptr(app.scale(panelWidth)), uintptr(app.scale(panelHeightFor(quotaSnapshot{}))),
 		hwnd, 0,
 		uintptr(app.instance),
 		0,
@@ -443,25 +512,31 @@ func run() error {
 	}
 	app.panelWindow = syscall.Handle(panel)
 
-	taskbarName, _ := syscall.UTF16PtrFromString("TaskbarCreated")
-	taskbarMsg, _, _ := procRegisterWindowMessage.Call(uintptr(unsafe.Pointer(taskbarName)))
+	taskbarMsg, _, _ := procRegisterWindowMessage.Call(uintptr(unsafe.Pointer(utf16Ptr("TaskbarCreated"))))
 	app.taskbarMsg = uint32(taskbarMsg)
 
 	if err := app.addTrayIcon(); err != nil {
-		return err
+		// At logon Explorer's notification area may not be ready yet. Keep
+		// running (the panel is shown below) and retry until it accepts the icon.
+		app.scheduleTrayRetry()
 	}
-	app.startFetch()
+	if updateFailure != "" {
+		app.queueAlert("上次更新未能完成。\n\n"+updateFailure, mbIconWarning)
+	}
+	app.showPanel()
+	app.startFetch(false)
 	go app.refreshLoop()
 	go app.quotaExpiryLoop()
 	go app.updateCheckLoop()
 	return app.messageLoop()
 }
 
-func registerWindowClass(className *uint16, instance syscall.Handle, callback uintptr) error {
+func registerWindowClass(className *uint16, instance syscall.Handle, callback uintptr, cursor syscall.Handle) error {
 	wc := wndClassEx{
 		Size:      uint32(unsafe.Sizeof(wndClassEx{})),
 		WndProc:   callback,
 		Instance:  instance,
+		Cursor:    cursor,
 		ClassName: className,
 	}
 	r, _, _ := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
@@ -469,6 +544,70 @@ func registerWindowClass(className *uint16, instance syscall.Handle, callback ui
 		return winError("RegisterClassExW")
 	}
 	return nil
+}
+
+// enableDPIAwareness must run before any window is created. System-DPI
+// awareness lets the tray icon be drawn at the shell's real small-icon size
+// and keeps panel text sharp instead of being bitmap-stretched by Windows.
+func enableDPIAwareness() {
+	if procSetProcessDpiAwareness.Find() == nil {
+		if r, _, _ := procSetProcessDpiAwareness.Call(dpiAwarenessContextSystemAware); r != 0 {
+			return
+		}
+	}
+	if procSetProcessDPIAware.Find() == nil {
+		procSetProcessDPIAware.Call()
+	}
+}
+
+func systemDPI() int32 {
+	dc, _, _ := procGetDC.Call(0)
+	if dc == 0 {
+		return baseDPI
+	}
+	defer procReleaseDC.Call(0, dc)
+	dpi, _, _ := procGetDeviceCaps.Call(dc, logPixelsX)
+	if dpi == 0 {
+		return baseDPI
+	}
+	return int32(dpi)
+}
+
+func trayIconSize() int {
+	size, _, _ := procGetSystemMetrics.Call(smCxSmIcon)
+	return min(max(int(size), 16), 128)
+}
+
+// showExistingInstance asks an already running instance to open its panel, so
+// launching the program again behaves like opening it.
+func showExistingInstance() {
+	hwnd, _, _ := procFindWindow.Call(uintptr(unsafe.Pointer(utf16Ptr(classMain))), 0)
+	if hwnd == 0 {
+		return
+	}
+	procAllowSetForeground.Call(asfwAny)
+	procPostMessage.Call(hwnd, wmShowPanelRequest, 0, 0)
+}
+
+func scaleForDPI(value, dpi int32) int32 {
+	if dpi <= 0 {
+		dpi = baseDPI
+	}
+	return int32((int64(value)*int64(dpi) + baseDPI/2) / baseDPI)
+}
+
+// scale converts a panel layout value (designed at 96 DPI) to device pixels.
+func (a *monitorApp) scale(value int32) int32 {
+	return scaleForDPI(value, a.dpi)
+}
+
+// logicalPoint converts a device-pixel client point to panel layout units.
+func (a *monitorApp) logicalPoint(pt point) point {
+	dpi := int64(a.dpi)
+	if dpi <= 0 {
+		dpi = baseDPI
+	}
+	return point{X: int32(int64(pt.X) * baseDPI / dpi), Y: int32(int64(pt.Y) * baseDPI / dpi)}
 }
 
 func (a *monitorApp) messageLoop() error {
@@ -504,15 +643,28 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 
 	if message == a.taskbarMsg && a.taskbarMsg != 0 && handle == a.mainWindow {
 		a.trayAdded = false
-		_ = a.addTrayIcon()
+		if a.addTrayIcon() != nil {
+			a.scheduleTrayRetry()
+		} else {
+			a.drainNotices()
+		}
 		return 0
 	}
 	if handle == a.mainWindow {
 		switch message {
 		case wmTray:
 			switch uint32(lParam) {
+			case wmLButtonDown:
+				a.trayPressed = true
+				a.trayPressHides = a.trayClickHidesPanel()
+				return 0
 			case wmLButtonUp:
-				if a.panelVisible {
+				hide := a.trayClickHidesPanel()
+				if a.trayPressed {
+					hide = a.trayPressHides
+				}
+				a.trayPressed = false
+				if hide {
 					a.hidePanel()
 				} else {
 					a.showPanel()
@@ -524,9 +676,9 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 			}
 		case wmStateChanged:
 			a.updateTray()
-			// Quota refreshes can add or remove the actual-account card. Keep
-			// the hidden window's geometry current too, then repaint immediately
-			// if it is visible; showPanel also uses this latest snapshot.
+			// Quota refreshes can add or remove account cards. Keep the hidden
+			// window's geometry current too, then repaint immediately if it is
+			// visible; showPanel also uses this latest snapshot.
 			a.resizePanel()
 			procInvalidateRect.Call(uintptr(a.panelWindow), 0, 1)
 			return 0
@@ -535,19 +687,33 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 			result := a.state.resetResult
 			a.state.resetResult = ""
 			a.state.mu.Unlock()
-			if result != "" {
-				flags := uintptr(mbOK | mbIconInformation)
-				if strings.Contains(result, "未能") || strings.Contains(result, "不确定") || strings.Contains(result, "失败") {
-					flags = mbOK | mbIconWarning
-				}
-				showMessageBox(a.mainWindow, result, flags)
+			flags := uintptr(mbOK | mbIconInformation)
+			if strings.Contains(result, "未能") || strings.Contains(result, "不确定") || strings.Contains(result, "失败") || strings.Contains(result, "未报告") {
+				flags = mbOK | mbIconWarning
 			}
+			a.messageBox(a.dialogOwner(), result, flags)
 			a.resetPending.Store(false)
 			a.fetching.Store(false)
-			if result != "" {
-				a.startFetch()
-			}
+			a.startFetch(false)
 			return 0
+		case wmShowAlert:
+			a.drainAlerts()
+			return 0
+		case wmShowNotice:
+			a.drainNotices()
+			return 0
+		case wmShowPanelRequest:
+			a.showPanel()
+			procSetForegroundWindow.Call(uintptr(a.panelWindow))
+			return 0
+		case wmTimer:
+			if wParam == trayRetryTimerID {
+				if a.addTrayIcon() == nil {
+					procKillTimer.Call(uintptr(a.mainWindow), trayRetryTimerID)
+					a.drainNotices()
+				}
+				return 0
+			}
 		case wmCommand:
 			a.handleMenuCommand(uint16(wParam))
 			return 0
@@ -559,7 +725,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	if handle == a.panelWindow {
 		switch message {
 		case wmLButtonDown:
-			pt := pointFromLParam(lParam)
+			pt := a.logicalPoint(pointFromLParam(lParam))
 			a.panelButton = a.panelButtonAt(pt)
 			if a.panelButton != "" {
 				return 0
@@ -570,7 +736,7 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		case wmLButtonUp:
 			button := a.panelButton
 			a.panelButton = ""
-			if button != "" && button == a.panelButtonAt(pointFromLParam(lParam)) {
+			if button != "" && button == a.panelButtonAt(a.logicalPoint(pointFromLParam(lParam))) {
 				a.handlePanelButton(button)
 			}
 			return 0
@@ -594,8 +760,11 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		case wmEraseBackground:
 			return 1
 		case wmActivate:
-			if uint16(wParam) == waInactive && !a.menuOpen && !a.snapshot().settings.AlwaysOnTop {
+			// Menus and message boxes owned by the panel take activation from
+			// it; only a real switch to another window should auto-hide it.
+			if uint16(wParam) == waInactive && !a.menuOpen && a.modalDepth == 0 && !a.snapshot().settings.AlwaysOnTop {
 				a.hidePanel()
+				a.panelAutoHiddenAt = time.Now()
 				return 0
 			}
 		case wmClose:
@@ -607,13 +776,21 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 	return r
 }
 
-func (a *monitorApp) startFetch() {
+// startFetch refreshes the quota in the background. A failure pops up an alert
+// when the user asked for the refresh, or when it is the first failure after a
+// success; repeated automatic failures only update the status line.
+func (a *monitorApp) startFetch(manual bool) {
+	if manual {
+		a.manualRefresh.Store(true)
+	}
 	if !a.fetching.CompareAndSwap(false, true) {
 		return
 	}
 	a.state.mu.Lock()
 	a.state.status = "正在刷新额度…"
+	serverURL := a.state.settings.ServerURL
 	a.state.mu.Unlock()
+	procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
 	go func() {
 		defer func() {
 			a.fetching.Store(false)
@@ -622,17 +799,25 @@ func (a *monitorApp) startFetch() {
 			default:
 			}
 		}()
-		quota, err := fetchQuota()
+		quota, err := fetchQuota(serverURL)
+		manual := a.manualRefresh.Swap(false)
+		alert := false
 		a.state.mu.Lock()
 		if err != nil {
-			a.state.status = "同步失败：" + shortError(err.Error())
+			a.state.status = "同步失败：" + shortError(quotaFailureCause(err).Error())
+			alert = manual || !a.state.fetchFailing
+			a.state.fetchFailing = true
 		} else {
 			a.state.quota = quota
 			a.state.updated = time.Now()
 			a.state.status = "更新于 " + a.state.updated.Format("15:04:05")
+			a.state.fetchFailing = false
 		}
 		a.state.mu.Unlock()
 		procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
+		if alert {
+			a.queueAlert("额度刷新失败。\n\n"+err.Error(), mbIconWarning)
+		}
 	}()
 }
 
@@ -643,7 +828,7 @@ func (a *monitorApp) refreshLoop() {
 	for {
 		select {
 		case <-timer.C:
-			a.startFetch()
+			a.startFetch(false)
 			timer.Reset(time.Duration(a.snapshot().settings.RefreshMinutes) * time.Minute)
 		case interval = <-a.intervalChange:
 			if !timer.Stop() {
@@ -657,52 +842,69 @@ func (a *monitorApp) refreshLoop() {
 	}
 }
 
+// quotaExpiryLoop forces a refresh whenever a quota window or reset credit
+// expires, and announces nominal-account windows that recover from 0%.
 func (a *monitorApp) quotaExpiryLoop() {
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	var handledThrough time.Time
+	recoveries := newQuotaRecoveryTracker()
 	for {
 		select {
 		case <-a.quotaChanged:
-			if timer != nil && !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			now := time.Now()
-			next, expired := nextQuotaExpiry(a.snapshot().quota, now, handledThrough)
-			if expired {
-				timer = time.NewTimer(0)
-				timerC = timer.C
-			} else if !next.IsZero() {
-				timer = time.NewTimer(time.Until(next))
-				timerC = timer.C
-			} else {
-				timerC = nil
-			}
 		case <-timerC:
-			timerC = nil
 			handledThrough = time.Now()
-			a.startFetch()
+			a.startFetch(false)
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		timer, timerC = nil, nil
+		now := time.Now()
+		quota := a.snapshot().quota
+		for _, notice := range recoveries.update(quota.Nominal, now) {
+			a.queueNotice(notice)
+		}
+		next, expired := nextQuotaExpiry(quota, now, handledThrough)
+		if due := recoveries.nextDue(); !due.IsZero() && (next.IsZero() || due.Before(next)) {
+			next = due
+		}
+		switch {
+		case expired:
+			timer = time.NewTimer(0)
+		case !next.IsZero():
+			timer = time.NewTimer(time.Until(next))
+		}
+		if timer != nil {
+			timerC = timer.C
 		}
 	}
 }
 
+func (a *monitorApp) scheduleTrayRetry() {
+	procSetTimer.Call(uintptr(a.mainWindow), trayRetryTimerID, trayRetryInterval, 0)
+}
+
 func (a *monitorApp) addTrayIcon() error {
-	icon := createTrayIcon(trayAccount(a.snapshot().quota))
+	icon := createTrayIcon(trayAccount(a.snapshot().quota), a.iconSize)
 	if icon == 0 {
 		return winError("CreateIconIndirect")
 	}
 	nid := a.notifyData(icon)
-	action := uintptr(nimAdd)
+	ok := false
 	if a.trayAdded {
-		action = nimModify
+		r, _, _ := procShellNotifyIcon.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
+		ok = r != 0
 	}
-	r, _, _ := procShellNotifyIcon.Call(action, uintptr(unsafe.Pointer(&nid)))
-	if r == 0 {
+	if !ok {
+		// Also covers an icon that vanished without a TaskbarCreated broadcast.
+		r, _, _ := procShellNotifyIcon.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+		ok = r != 0
+	}
+	if !ok {
+		err := winError("Shell_NotifyIconW")
 		procDestroyIcon.Call(uintptr(icon))
-		return winError("Shell_NotifyIconW")
+		return err
 	}
 	a.trayAdded = true
 	old := a.trayIcon
@@ -729,13 +931,106 @@ func (a *monitorApp) notifyData(icon syscall.Handle) notifyIconData {
 		CallbackMessage: wmTray,
 		Icon:            icon,
 	}
-	s := a.tooltip()
-	u16 := utf16.Encode([]rune(s))
-	if len(u16) > len(nid.Tooltip)-1 {
-		u16 = u16[:len(nid.Tooltip)-1]
-	}
-	copy(nid.Tooltip[:], u16)
+	copyUTF16(nid.Tooltip[:], a.tooltip())
 	return nid
+}
+
+func copyUTF16(dst []uint16, s string) {
+	u16 := utf16.Encode([]rune(strings.ReplaceAll(s, "\x00", "")))
+	if len(u16) > len(dst)-1 {
+		u16 = u16[:len(dst)-1]
+	}
+	copy(dst, u16)
+}
+
+// showTrayNotification shows a Windows notification (toast) from the tray icon.
+func (a *monitorApp) showTrayNotification(title, text string) bool {
+	if !a.trayAdded {
+		return false
+	}
+	nid := notifyIconData{
+		Size:      uint32(unsafe.Sizeof(notifyIconData{})),
+		Window:    a.mainWindow,
+		ID:        iconID,
+		Flags:     nifInfo,
+		InfoFlags: niifInfo,
+	}
+	copyUTF16(nid.InfoTitle[:], title)
+	copyUTF16(nid.Info[:], text)
+	r, _, _ := procShellNotifyIcon.Call(nimModify, uintptr(unsafe.Pointer(&nid)))
+	return r != 0
+}
+
+func (a *monitorApp) queueNotice(notice quotaRecoveryNotice) {
+	a.state.mu.Lock()
+	a.state.notices = append(a.state.notices, notice)
+	a.state.mu.Unlock()
+	procPostMessage.Call(uintptr(a.mainWindow), wmShowNotice, 0, 0)
+}
+
+// drainNotices runs on the UI thread. Notices wait while the tray icon is
+// missing and are shown once it has been added.
+func (a *monitorApp) drainNotices() {
+	if !a.trayAdded {
+		return
+	}
+	a.state.mu.Lock()
+	notices := a.state.notices
+	a.state.notices = nil
+	a.state.mu.Unlock()
+	for _, notice := range notices {
+		a.showTrayNotification(notice.title, notice.text)
+	}
+}
+
+// queueAlert shows a message box from any goroutine. Alerts are shown one at a
+// time on the UI thread; an identical alert that is already waiting is dropped.
+func (a *monitorApp) queueAlert(text string, flags uintptr) {
+	a.state.mu.Lock()
+	for _, pending := range a.state.alerts {
+		if pending.text == text {
+			a.state.mu.Unlock()
+			return
+		}
+	}
+	a.state.alerts = append(a.state.alerts, alertMessage{text: text, flags: flags})
+	a.state.mu.Unlock()
+	procPostMessage.Call(uintptr(a.mainWindow), wmShowAlert, 0, 0)
+}
+
+func (a *monitorApp) drainAlerts() {
+	if a.alertOpen {
+		// The running loop below picks up alerts queued while a box is open.
+		return
+	}
+	a.alertOpen = true
+	defer func() { a.alertOpen = false }()
+	for {
+		a.state.mu.Lock()
+		if len(a.state.alerts) == 0 {
+			a.state.mu.Unlock()
+			return
+		}
+		next := a.state.alerts[0]
+		a.state.alerts = a.state.alerts[1:]
+		a.state.mu.Unlock()
+		a.messageBox(a.dialogOwner(), next.text, mbOK|next.flags|mbSetForeground|mbTopmost)
+	}
+}
+
+// messageBox shows a modal box while telling the panel's activation handler
+// that losing focus to it must not auto-hide the panel.
+func (a *monitorApp) messageBox(owner syscall.Handle, text string, flags uintptr) int32 {
+	a.modalDepth++
+	defer func() { a.modalDepth-- }()
+	return showMessageBox(owner, text, flags)
+}
+
+func (a *monitorApp) dialogOwner() syscall.Handle {
+	if a.panelVisible {
+		return a.panelWindow
+	}
+	return a.mainWindow
 }
 
 func (a *monitorApp) tooltip() string {
@@ -757,17 +1052,16 @@ func (a *monitorApp) tooltip() string {
 	return result
 }
 
+// trayAccount picks the account shown in the tray: the first actual account
+// when the server reports one, otherwise the first nominal account.
 func trayAccount(quota quotaSnapshot) accountQuota {
-	if quota.NominalAvailable && (quota.SingleAccount || !quota.ActualAvailable) {
-		return quota.Nominal
+	if len(quota.Actual) > 0 {
+		return quota.Actual[0]
 	}
-	if quota.ActualAvailable {
-		return quota.Actual
+	if len(quota.Nominal) > 0 {
+		return quota.Nominal[0]
 	}
-	if quota.NominalAvailable {
-		return quota.Nominal
-	}
-	return quota.Actual
+	return accountQuota{}
 }
 
 func (a *monitorApp) snapshot() appState {
@@ -780,10 +1074,20 @@ func (a *monitorApp) snapshot() appState {
 		settings:        a.state.settings,
 		startup:         a.state.startup,
 		updateStatus:    a.state.updateStatus,
-		updateChecking:  a.state.updateChecking,
 		updateAvailable: a.state.updateAvailable,
 		updateRelease:   a.state.updateRelease,
 	}
+}
+
+// trayClickHidesPanel reports whether a tray click should close the panel. In
+// non-topmost mode, pressing the tray icon first activates the taskbar, which
+// auto-hides the panel before the click arrives; that click must not reopen it.
+func (a *monitorApp) trayClickHidesPanel() bool {
+	return a.panelVisible || time.Since(a.panelAutoHiddenAt) < trayToggleGrace
+}
+
+func (a *monitorApp) panelSize(quota quotaSnapshot) (int32, int32) {
+	return a.scale(panelWidth), a.scale(panelHeightFor(quota))
 }
 
 func (a *monitorApp) showPanel() {
@@ -792,14 +1096,12 @@ func (a *monitorApp) showPanel() {
 	}
 	snapshot := a.snapshot()
 	settings := snapshot.settings
-	height := panelHeightFor(snapshot.quota)
+	width, height := a.panelSize(snapshot.quota)
 	var x, y int32
 	if settings.PositionSet {
-		x, y = clampPanelPosition(settings.PanelX, settings.PanelY, height)
+		x, y = clampPanelPosition(settings.PanelX, settings.PanelY, width, height)
 	} else {
-		pt := point{}
-		procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
-		x, y = panelPosition(pt, height)
+		x, y = panelPosition(a.panelAnchor(), width, height, a.scale(8))
 	}
 	insertAfter := uintptr(hwndTop)
 	if settings.AlwaysOnTop {
@@ -807,7 +1109,7 @@ func (a *monitorApp) showPanel() {
 	}
 	procSetWindowPos.Call(
 		uintptr(a.panelWindow), insertAfter,
-		uintptr(x), uintptr(y), panelWidth, uintptr(height),
+		uintptr(x), uintptr(y), uintptr(width), uintptr(height),
 		swpShowWindow,
 	)
 	procShowWindow.Call(uintptr(a.panelWindow), swShow)
@@ -824,9 +1126,24 @@ func (a *monitorApp) resizePanel() {
 	if r, _, _ := procGetWindowRect.Call(uintptr(a.panelWindow), uintptr(unsafe.Pointer(&bounds))); r == 0 {
 		return
 	}
-	height := panelHeightFor(a.snapshot().quota)
-	x, y := clampPanelPosition(bounds.Left, bounds.Top, height)
-	procSetWindowPos.Call(uintptr(a.panelWindow), 0, uintptr(x), uintptr(y), panelWidth, uintptr(height), swpNoActivate|swpNoZOrder)
+	width, height := a.panelSize(a.snapshot().quota)
+	x, y := clampPanelPosition(bounds.Left, bounds.Top, width, height)
+	procSetWindowPos.Call(uintptr(a.panelWindow), 0, uintptr(x), uintptr(y), uintptr(width), uintptr(height), swpNoActivate|swpNoZOrder)
+}
+
+// panelAnchor is the point the panel opens next to when no position has been
+// saved: the tray icon when the shell can locate it, otherwise the cursor.
+func (a *monitorApp) panelAnchor() point {
+	if a.trayAdded {
+		id := notifyIconIdentifier{Size: uint32(unsafe.Sizeof(notifyIconIdentifier{})), Window: a.mainWindow, ID: iconID}
+		bounds := rect{}
+		if r, _, _ := procShellNotifyIconGetRect.Call(uintptr(unsafe.Pointer(&id)), uintptr(unsafe.Pointer(&bounds))); r == 0 && bounds.Right > bounds.Left {
+			return point{X: (bounds.Left + bounds.Right) / 2, Y: (bounds.Top + bounds.Bottom) / 2}
+		}
+	}
+	pt := point{}
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	return pt
 }
 
 func (a *monitorApp) savePanelPosition() {
@@ -852,40 +1169,42 @@ func (a *monitorApp) hidePanel() {
 	a.panelVisible = false
 }
 
-func panelPosition(pt point, height int32) (int32, int32) {
-	monitor, _, _ := procMonitorFromPoint.Call(*(*uintptr)(unsafe.Pointer(&pt)), monDefaultToNearest)
+func panelPosition(anchor point, width, height, gap int32) (int32, int32) {
+	monitor, _, _ := procMonitorFromPoint.Call(*(*uintptr)(unsafe.Pointer(&anchor)), monDefaultToNearest)
 	mi := monitorInfo{Size: uint32(unsafe.Sizeof(monitorInfo{}))}
 	procGetMonitorInfo.Call(monitor, uintptr(unsafe.Pointer(&mi)))
-	x := pt.X - panelWidth/2
-	y := pt.Y - height - 8
+	x := anchor.X - width/2
+	y := anchor.Y - height - gap
 	if y < mi.Work.Top {
-		y = pt.Y + 8
+		y = anchor.Y + gap
 	}
-	return clampToWorkArea(x, y, height, mi.Work)
+	return clampToWorkArea(x, y, width, height, mi.Work)
 }
 
-func clampPanelPosition(x, y, height int32) (int32, int32) {
-	center := point{X: x + panelWidth/2, Y: y + height/2}
+func clampPanelPosition(x, y, width, height int32) (int32, int32) {
+	center := point{X: x + width/2, Y: y + height/2}
 	monitor, _, _ := procMonitorFromPoint.Call(*(*uintptr)(unsafe.Pointer(&center)), monDefaultToNearest)
 	mi := monitorInfo{Size: uint32(unsafe.Sizeof(monitorInfo{}))}
 	if r, _, _ := procGetMonitorInfo.Call(monitor, uintptr(unsafe.Pointer(&mi))); r == 0 {
 		return x, y
 	}
-	return clampToWorkArea(x, y, height, mi.Work)
+	return clampToWorkArea(x, y, width, height, mi.Work)
 }
 
-func clampToWorkArea(x, y, height int32, work rect) (int32, int32) {
+// clampToWorkArea keeps the panel inside the work area. If the panel is taller
+// than the work area its top edge stays visible.
+func clampToWorkArea(x, y, width, height int32, work rect) (int32, int32) {
+	if x+width > work.Right {
+		x = work.Right - width
+	}
 	if x < work.Left {
 		x = work.Left
 	}
-	if x+panelWidth > work.Right {
-		x = work.Right - panelWidth
+	if y+height > work.Bottom {
+		y = work.Bottom - height
 	}
 	if y < work.Top {
 		y = work.Top
-	}
-	if y+height > work.Bottom {
-		y = work.Bottom - height
 	}
 	return x, y
 }
@@ -897,9 +1216,10 @@ func (a *monitorApp) showMenu() {
 	}
 	defer procDestroyMenu.Call(menu)
 	a.menuOpen = true
+	snapshot := a.snapshot()
 	appendMenu(menu, 0, menuRefresh, "立即刷新")
 	appendMenu(menu, 0, menuCheckUpdates, "检查更新")
-	if snapshot := a.snapshot(); snapshot.updateAvailable {
+	if snapshot.updateAvailable {
 		flags := uintptr(0)
 		label := "更新到 " + snapshot.updateRelease.Tag
 		if a.installingUpdate.Load() {
@@ -916,7 +1236,7 @@ func (a *monitorApp) showMenu() {
 		appendMenu(intervalMenu, 0, menuRefresh30, "30分钟")
 		appendMenu(intervalMenu, 0, menuRefresh60, "1小时")
 		appendMenu(menu, 0x00000010, intervalMenu, "刷新间隔")
-		minutes := a.snapshot().settings.RefreshMinutes
+		minutes := snapshot.settings.RefreshMinutes
 		checkMenu(intervalMenu, menuRefresh10, minutes == 10)
 		checkMenu(intervalMenu, menuRefresh20, minutes == 20)
 		checkMenu(intervalMenu, menuRefresh30, minutes == 30)
@@ -928,8 +1248,8 @@ func (a *monitorApp) showMenu() {
 	appendMenu(menu, 0, menuStartup, "登录 Windows 时启动")
 	appendMenu(menu, 0x00000800, 0, "")
 	appendMenu(menu, 0, menuExit, "退出")
-	checkMenu(menu, menuTopmost, a.snapshot().settings.AlwaysOnTop)
-	checkMenu(menu, menuStartup, a.state.startup)
+	checkMenu(menu, menuTopmost, snapshot.settings.AlwaysOnTop)
+	checkMenu(menu, menuStartup, snapshot.startup)
 
 	pt := point{}
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
@@ -979,11 +1299,17 @@ func (a *monitorApp) handlePanelButton(button string) {
 	}
 }
 
+// panelButtonAt hit-tests a point in panel layout units.
 func (a *monitorApp) panelButtonAt(pt point) string {
+	s := a.snapshot()
+	cards, _ := panelLayout(s.quota)
+	for _, card := range cards {
+		if card.resetButton && containsPoint(panelResetButtonRect(card.top, card.height), pt) {
+			return "reset"
+		}
+	}
 	switch {
-	case containsPoint(panelResetButtonRect(46, nominalCardHeight(a.snapshot().quota.Nominal)), pt) && a.snapshot().quota.ResetSupported:
-		return "reset"
-	case containsPoint(panelUpdateButtonRect(), pt) && a.snapshot().updateAvailable && !a.installingUpdate.Load() && !strings.HasPrefix(a.snapshot().updateStatus, "更新失败"):
+	case containsPoint(panelUpdateButtonRect(), pt) && s.updateAvailable && !a.installingUpdate.Load() && !strings.HasPrefix(s.updateStatus, "更新失败"):
 		return "update"
 	case containsPoint(panelThemeButtonRect(), pt):
 		return "theme"
@@ -1034,8 +1360,7 @@ func pointFromLParam(lParam uintptr) point {
 }
 
 func appendMenu(menu uintptr, flags, id uintptr, text string) {
-	p, _ := syscall.UTF16PtrFromString(text)
-	procAppendMenu.Call(menu, flags, id, uintptr(unsafe.Pointer(p)))
+	procAppendMenu.Call(menu, flags, id, uintptr(unsafe.Pointer(utf16Ptr(text))))
 }
 
 func checkMenu(menu uintptr, id uint16, checked bool) {
@@ -1049,7 +1374,7 @@ func checkMenu(menu uintptr, id uint16, checked bool) {
 func (a *monitorApp) handleMenuCommand(command uint16) {
 	switch command {
 	case menuRefresh:
-		a.startFetch()
+		a.startFetch(true)
 	case menuCheckUpdates:
 		a.checkForUpdate(true)
 	case menuInstallUpdate:
@@ -1079,6 +1404,7 @@ func (a *monitorApp) handleMenuCommand(command uint16) {
 			a.state.status = "开机启动设置失败：" + shortError(err.Error())
 			a.state.mu.Unlock()
 			procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
+			a.queueAlert("开机启动设置失败。\n\n"+err.Error(), mbIconWarning)
 		}
 	case menuExit:
 		a.shutdown()
@@ -1122,42 +1448,33 @@ func (a *monitorApp) setRefreshInterval(minutes int) {
 
 func (a *monitorApp) resetQuota() {
 	if a.resetPending.Load() {
-		showMessageBox(a.panelWindow, "上一次重置结果仍在处理中，请稍候。", mbOK|mbIconInformation)
+		a.messageBox(a.panelWindow, "上一次重置结果仍在处理中，请稍候。", mbOK|mbIconInformation)
 		return
 	}
 	snapshot := a.snapshot()
 	if !snapshot.quota.ResetSupported {
-		showMessageBox(a.panelWindow, "当前认证方式不支持此重置操作。", mbOK|mbIconInformation)
+		a.messageBox(a.panelWindow, "当前认证方式不支持此重置操作。", mbOK|mbIconInformation)
 		return
 	}
-	if snapshot.quota.Nominal.Reset.AvailableCount < 1 {
-		showMessageBox(a.panelWindow, "当前没有可用的重置次数，因此没有发送请求。", mbOK|mbIconInformation)
+	if availableResetCredits(snapshot.quota.Nominal) < 1 {
+		a.messageBox(a.panelWindow, "当前没有可用的重置次数，因此没有发送请求。", mbOK|mbIconInformation)
 		return
 	}
-	confirmation := fmt.Sprintf(
-		"即将为名义账户 %s 消耗 1 次可用重置额度。\n\n服务端会对该 API Key 对应名义前缀下的每个账户最多消耗 1 次；你已说明当前服务端配置为单账号。\n\n重置可能无法撤销，是否继续？",
-		accountEmail(snapshot.quota.Nominal),
-	)
-	if snapshot.quota.DirectMode {
-		confirmation = fmt.Sprintf(
-			"即将使用当前 Codex 认证为账户 %s 消耗 1 次可用重置额度。\n\n该操作会直接请求插件的账户重置接口，可能无法撤销；请求不会自动重试。是否继续？",
-			accountEmail(snapshot.quota.Nominal),
-		)
-	}
-	if showMessageBox(a.panelWindow, confirmation, mbYesNo|mbIconWarning|mbDefaultButton2) != idYes {
+	if a.messageBox(a.panelWindow, resetConfirmation(snapshot.quota), mbYesNo|mbIconWarning|mbDefaultButton2) != idYes {
 		return
 	}
 	if !a.fetching.CompareAndSwap(false, true) {
-		showMessageBox(a.panelWindow, "当前正在刷新额度或执行其他操作，请稍后再试。", mbOK|mbIconInformation)
+		a.messageBox(a.panelWindow, "当前正在刷新额度或执行其他操作，请稍后再试。", mbOK|mbIconInformation)
 		return
 	}
 	a.resetPending.Store(true)
 	a.state.mu.Lock()
 	a.state.status = "正在消耗重置额度…"
+	serverURL := a.state.settings.ServerURL
 	a.state.mu.Unlock()
 	procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
 	go func() {
-		result, err := requestQuotaReset()
+		result, err := requestQuotaReset(serverURL)
 		if err != nil {
 			detail := err.Error()
 			if strings.Contains(detail, "读取 Codex 凭据") {
@@ -1179,7 +1496,46 @@ func (a *monitorApp) resetQuota() {
 	}()
 }
 
+func availableResetCredits(accounts []accountQuota) int {
+	total := 0
+	for _, account := range accounts {
+		total += account.Reset.AvailableCount
+	}
+	return total
+}
+
+func resetConfirmation(quota quotaSnapshot) string {
+	first := accountQuota{}
+	if len(quota.Nominal) > 0 {
+		first = quota.Nominal[0]
+	}
+	if quota.DirectMode {
+		return fmt.Sprintf(
+			"即将使用当前 Codex 认证为账户 %s 消耗 1 次可用重置额度。\n\n该操作会直接请求插件的账户重置接口，可能无法撤销；请求不会自动重试。是否继续？",
+			accountEmail(first),
+		)
+	}
+	if len(quota.Nominal) <= 1 {
+		return fmt.Sprintf(
+			"即将为名义账户 %s 消耗 1 次可用重置额度。\n\n重置可能无法撤销；请求不会自动重试。是否继续？",
+			accountEmail(first),
+		)
+	}
+	emails := make([]string, 0, len(quota.Nominal))
+	for _, account := range quota.Nominal {
+		emails = append(emails, accountEmail(account))
+	}
+	return fmt.Sprintf(
+		"服务端会对该 API Key 名义前缀下符合条件的每个账户各消耗最多 1 次可用重置额度，共 %d 个账户：\n\n%s\n\n重置可能无法撤销；请求不会自动重试。是否继续？",
+		len(quota.Nominal), strings.Join(emails, "\n"),
+	)
+}
+
 func (a *monitorApp) shutdown() {
+	if a.closing {
+		return
+	}
+	a.closing = true
 	if a.trayAdded {
 		nid := a.notifyData(a.trayIcon)
 		procShellNotifyIcon.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
@@ -1193,10 +1549,44 @@ func (a *monitorApp) shutdown() {
 	procPostQuitMessage.Call(0)
 }
 
+// Panel layout values are in 96-DPI units; paintPanel maps them to the real
+// DPI with a GDI mapping mode, and window sizes go through monitorApp.scale.
 const (
-	panelWidth       = 540
-	actualCardHeight = 94
+	panelWidth        = 540
+	panelHeaderHeight = 46
+	panelCardGap      = 10
+	panelBottomMargin = 14
+	actualCardHeight  = 94
 )
+
+type panelCard struct {
+	account     accountQuota
+	nominal     bool
+	top         int32
+	height      int32
+	resetButton bool
+}
+
+// panelLayout stacks one card per nominal account, then one per actual
+// account. Before the first successful sync an empty nominal card is shown.
+func panelLayout(quota quotaSnapshot) ([]panelCard, int32) {
+	nominal := quota.Nominal
+	if len(nominal) == 0 {
+		nominal = []accountQuota{{}}
+	}
+	cards := make([]panelCard, 0, len(nominal)+len(quota.Actual))
+	top := int32(panelHeaderHeight)
+	for i, account := range nominal {
+		height := nominalCardHeight(account)
+		cards = append(cards, panelCard{account: account, nominal: true, top: top, height: height, resetButton: i == 0 && quota.ResetSupported})
+		top += height + panelCardGap
+	}
+	for _, account := range quota.Actual {
+		cards = append(cards, panelCard{account: account, top: top, height: actualCardHeight})
+		top += actualCardHeight + panelCardGap
+	}
+	return cards, top - panelCardGap + panelBottomMargin
+}
 
 type panelColors struct {
 	background uint32
@@ -1218,18 +1608,24 @@ func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
 	defer procEndPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
 	s := a.snapshot()
 	colors := colorsForTheme(s.settings.ThemeMode)
+	cards, height := panelLayout(s.quota)
+
+	// Draw in 96-DPI layout units and let GDI scale coordinates, pens and font
+	// sizes to the real DPI, so text is rasterized at full resolution.
+	procSetMapMode.Call(hdc, mmAnisotropic)
+	procSetWindowExtEx.Call(hdc, baseDPI, baseDPI, 0)
+	procSetViewportExtEx.Call(hdc, uintptr(a.dpi), uintptr(a.dpi), 0)
 
 	background := createBrush(colors.background)
 	defer procDeleteObject.Call(uintptr(background))
-	full := rect{Right: panelWidth, Bottom: panelHeightFor(s.quota)}
+	full := rect{Right: panelWidth + 1, Bottom: height + 1}
 	procFillRect.Call(hdc, uintptr(unsafe.Pointer(&full)), uintptr(background))
 	procSetBkMode.Call(hdc, 1)
-	fontFace, _ := syscall.UTF16PtrFromString("Microsoft YaHei UI")
 	fontHeight := int32(-17)
 	font, _, _ := procCreateFont.Call(
 		uintptr(fontHeight), 0, 0, 0, 500,
 		0, 0, 0, 1, 0, 0, 5, 0,
-		uintptr(unsafe.Pointer(fontFace)),
+		uintptr(unsafe.Pointer(utf16Ptr("Microsoft YaHei UI"))),
 	)
 	if font != 0 {
 		defer procDeleteObject.Call(font)
@@ -1262,25 +1658,29 @@ func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
 	drawPanelButton(hdc, panelMinimizeButtonRect(), "—", colors)
 	drawPanelButton(hdc, panelExitButtonRect(), "×", colors)
 
-	nominalTop := int32(46)
-	nominalHeight := nominalCardHeight(s.quota.Nominal)
-	drawNominalAccountCard(hdc, colors, nominalTop, nominalHeight, s.quota.Nominal, s.quota.DirectMode, s.quota.SingleAccount, s.quota.ResetSupported)
-	if s.quota.ActualAvailable {
-		actualTop := nominalTop + nominalHeight + 10
-		drawActualAccountCard(hdc, colors, actualTop, s.quota.Actual)
+	for _, card := range cards {
+		if card.nominal {
+			drawNominalAccountCard(hdc, colors, card, s.quota.DirectMode, s.quota.singleAccount())
+		} else {
+			drawActualAccountCard(hdc, colors, card.top, card.account)
+		}
 	}
 }
 
-func drawPanelButton(hdc uintptr, bounds rect, label string, colors panelColors) {
-	brush := createBrush(colors.button)
-	pen, _, _ := procCreatePen.Call(0, 1, uintptr(colors.border))
+func drawRoundRect(hdc uintptr, bounds rect, radius int32, fill, border uint32) {
+	brush := createBrush(fill)
+	pen, _, _ := procCreatePen.Call(0, 1, uintptr(border))
 	oldBrush, _, _ := procSelectObject.Call(hdc, uintptr(brush))
 	oldPen, _, _ := procSelectObject.Call(hdc, pen)
-	procRoundRect.Call(hdc, uintptr(bounds.Left), uintptr(bounds.Top), uintptr(bounds.Right), uintptr(bounds.Bottom), 6, 6)
+	procRoundRect.Call(hdc, uintptr(bounds.Left), uintptr(bounds.Top), uintptr(bounds.Right), uintptr(bounds.Bottom), uintptr(radius), uintptr(radius))
 	procSelectObject.Call(hdc, oldPen)
 	procSelectObject.Call(hdc, oldBrush)
 	procDeleteObject.Call(pen)
 	procDeleteObject.Call(uintptr(brush))
+}
+
+func drawPanelButton(hdc uintptr, bounds rect, label string, colors panelColors) {
+	drawRoundRect(hdc, bounds, 6, colors.button, colors.border)
 	drawText(hdc, label, bounds, colors.buttonText, dtSingleLine|dtVCenter|dtCenter)
 }
 
@@ -1291,20 +1691,13 @@ func drawPinButton(hdc uintptr, bounds rect, colors panelColors, enabled bool) {
 		background = colorRef(63, 139, 214)
 		iconColor = colorRef(255, 255, 255)
 	}
-	brush := createBrush(background)
-	pen, _, _ := procCreatePen.Call(0, 1, uintptr(colors.border))
-	oldBrush, _, _ := procSelectObject.Call(hdc, uintptr(brush))
-	oldPen, _, _ := procSelectObject.Call(hdc, pen)
-	procRoundRect.Call(hdc, uintptr(bounds.Left), uintptr(bounds.Top), uintptr(bounds.Right), uintptr(bounds.Bottom), 6, 6)
-	procSelectObject.Call(hdc, oldPen)
-	procSelectObject.Call(hdc, oldBrush)
-	procDeleteObject.Call(pen)
-	procDeleteObject.Call(uintptr(brush))
+	drawRoundRect(hdc, bounds, 6, background, colors.border)
 	drawText(hdc, "📌", bounds, iconColor, dtSingleLine|dtVCenter|dtCenter)
 }
 
-func drawNominalAccountCard(hdc uintptr, colors panelColors, top, height int32, account accountQuota, directMode, singleAccount, resetSupported bool) {
-	drawCardBackground(hdc, colors, top, height)
+func drawNominalAccountCard(hdc uintptr, colors panelColors, card panelCard, directMode, singleAccount bool) {
+	top, account := card.top, card.account
+	drawCardBackground(hdc, colors, top, card.height)
 	accountTitle := nominalAccountTitle(directMode, singleAccount)
 	drawText(hdc, accountTitle+"  ·  "+accountEmail(account),
 		rect{Left: 27, Top: top + 5, Right: panelWidth - 25, Bottom: top + 29}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
@@ -1313,8 +1706,8 @@ func drawNominalAccountCard(hdc uintptr, colors panelColors, top, height int32, 
 	drawHorizontalDivider(hdc, 27, panelWidth-27, top+83, colors.border)
 	drawText(hdc, fmt.Sprintf("重置次数  ·  %d 次", account.Reset.AvailableCount),
 		rect{Left: 27, Top: top + 86, Right: panelWidth - 74, Bottom: top + 109}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
-	if resetSupported {
-		drawPanelButton(hdc, panelResetButtonRect(top, height), "↻", colors)
+	if card.resetButton {
+		drawPanelButton(hdc, panelResetButtonRect(top, card.height), "↻", colors)
 	}
 	for i, line := range resetCreditLines(account.Reset, time.Now()) {
 		rowTop := top + 112 + int32(i)*20
@@ -1348,15 +1741,7 @@ func accountEmail(account accountQuota) string {
 }
 
 func drawCardBackground(hdc uintptr, colors panelColors, top, height int32) {
-	brush := createBrush(colors.card)
-	pen, _, _ := procCreatePen.Call(0, 1, uintptr(colors.border))
-	oldBrush, _, _ := procSelectObject.Call(hdc, uintptr(brush))
-	oldPen, _, _ := procSelectObject.Call(hdc, pen)
-	procRoundRect.Call(hdc, 14, uintptr(top), panelWidth-14, uintptr(top+height), 9, 9)
-	procSelectObject.Call(hdc, oldPen)
-	procSelectObject.Call(hdc, oldBrush)
-	procDeleteObject.Call(pen)
-	procDeleteObject.Call(uintptr(brush))
+	drawRoundRect(hdc, rect{Left: 14, Top: top, Right: panelWidth - 14, Bottom: top + height}, 9, colors.card, colors.border)
 }
 
 func drawHorizontalDivider(hdc uintptr, left, right, y int32, color uint32) {
@@ -1370,32 +1755,12 @@ func drawHorizontalDivider(hdc uintptr, left, right, y int32, color uint32) {
 
 func drawMeter(hdc uintptr, label string, left, top int32, bucket quotaBucket, colors panelColors) {
 	drawText(hdc, label, rect{Left: left, Top: top - 4, Right: left + 54, Bottom: top + 16}, colors.muted, dtSingleLine|dtVCenter)
-	trackBrush := createBrush(colors.track)
-	trackPen, _, _ := procCreatePen.Call(0, 1, uintptr(colors.track))
-	oldBrush, _, _ := procSelectObject.Call(hdc, uintptr(trackBrush))
-	oldPen, _, _ := procSelectObject.Call(hdc, trackPen)
 	barLeft, barRight := left+64, left+235
-	procRoundRect.Call(hdc, uintptr(barLeft), uintptr(top), uintptr(barRight), uintptr(top+12), 6, 6)
-	procSelectObject.Call(hdc, oldPen)
-	procSelectObject.Call(hdc, oldBrush)
-	procDeleteObject.Call(trackPen)
-	procDeleteObject.Call(uintptr(trackBrush))
-
+	drawRoundRect(hdc, rect{Left: barLeft, Top: top, Right: barRight, Bottom: top + 12}, 6, colors.track, colors.track)
 	if bucket.Known && bucket.Percent > 0 {
-		width := int32(float64(barRight-barLeft) * float64(bucket.Percent) / 100.0)
-		if width < 4 {
-			width = 4
-		}
+		width := max(int32(float64(barRight-barLeft)*float64(bucket.Percent)/100.0), 4)
 		fill := quotaColor(bucket.Percent)
-		fillBrush := createBrush(fill)
-		fillPen, _, _ := procCreatePen.Call(0, 1, uintptr(fill))
-		oldBrush, _, _ := procSelectObject.Call(hdc, uintptr(fillBrush))
-		oldPen, _, _ := procSelectObject.Call(hdc, fillPen)
-		procRoundRect.Call(hdc, uintptr(barLeft), uintptr(top), uintptr(barLeft+width), uintptr(top+12), 6, 6)
-		procSelectObject.Call(hdc, oldPen)
-		procSelectObject.Call(hdc, oldBrush)
-		procDeleteObject.Call(fillPen)
-		procDeleteObject.Call(uintptr(fillBrush))
+		drawRoundRect(hdc, rect{Left: barLeft, Top: top, Right: barLeft + width, Bottom: top + 12}, 6, fill, fill)
 	}
 	drawText(hdc, bucketText(bucket),
 		rect{Left: barRight + 8, Top: top - 4, Right: barRight + 64, Bottom: top + 16},
@@ -1430,9 +1795,20 @@ func quotaColor(percent int) uint32 {
 }
 
 func drawText(hdc uintptr, text string, bounds rect, color uint32, flags uintptr) {
-	wide, _ := syscall.UTF16FromString(text)
 	procSetTextColor.Call(hdc, uintptr(color))
-	procDrawText.Call(hdc, uintptr(unsafe.Pointer(&wide[0])), ^uintptr(0), uintptr(unsafe.Pointer(&bounds)), flags)
+	procDrawText.Call(hdc, uintptr(unsafe.Pointer(utf16Ptr(text))), ^uintptr(0), uintptr(unsafe.Pointer(&bounds)), flags)
+}
+
+// utf16Text converts s for Win32 calls. Interior NULs (which can arrive in
+// server-provided text) are dropped instead of making the conversion fail,
+// so the result always holds at least the terminating NUL.
+func utf16Text(s string) []uint16 {
+	wide, _ := syscall.UTF16FromString(strings.ReplaceAll(s, "\x00", ""))
+	return wide
+}
+
+func utf16Ptr(s string) *uint16 {
+	return &utf16Text(s)[0]
 }
 
 func createBrush(color uint32) syscall.Handle {
@@ -1483,8 +1859,8 @@ func colorsForTheme(mode string) panelColors {
 }
 
 func systemPrefersLightTheme() bool {
-	keyPath, _ := syscall.UTF16PtrFromString("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
-	valueName, _ := syscall.UTF16PtrFromString("AppsUseLightTheme")
+	keyPath := utf16Ptr("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+	valueName := utf16Ptr("AppsUseLightTheme")
 	var key uintptr
 	r, _, _ := procRegOpenKeyEx.Call(hkeyCurrentUser, uintptr(unsafe.Pointer(keyPath)), 0, keyQueryValue, uintptr(unsafe.Pointer(&key)))
 	if r != 0 {
@@ -1507,10 +1883,7 @@ func nominalCardHeight(account accountQuota) int32 {
 }
 
 func panelHeightFor(quota quotaSnapshot) int32 {
-	height := int32(46) + nominalCardHeight(quota.Nominal) + 14
-	if quota.ActualAvailable {
-		height += 10 + actualCardHeight
-	}
+	_, height := panelLayout(quota)
 	return height
 }
 
@@ -1532,7 +1905,7 @@ func resetCreditLines(info resetCreditInfo, now time.Time) []string {
 	sort.Slice(valid, func(i, j int) bool { return valid[i].at.Before(valid[j].at) })
 	lines := make([]string, 0, len(valid)+len(invalid)+2)
 	for _, item := range valid {
-		lines = append(lines, "到期 "+item.at.Local().Format("2006-01-02 15:04")+"  ·  剩余 "+remainingTime(item.at.Sub(now)))
+		lines = append(lines, "到期 "+item.at.Local().Format("2006-01-02 15:04")+"  ·  剩余 "+formatRemaining(item.at.Sub(now)))
 	}
 	lines = append(lines, invalid...)
 	if info.WithoutExpiry > 0 {
@@ -1557,60 +1930,77 @@ func resetCreditLines(info resetCreditInfo, now time.Time) []string {
 	return lines
 }
 
-func remainingTime(remaining time.Duration) string {
+// formatRemaining renders a countdown: minutes under an hour, hours and
+// minutes under a day, days and hours beyond that.
+func formatRemaining(remaining time.Duration) string {
 	if remaining <= 0 {
 		return "已到期"
 	}
 	if remaining < time.Hour {
-		minutes := int(remaining.Minutes())
-		if minutes < 1 {
-			minutes = 1
-		}
-		return fmt.Sprintf("%d 分钟", minutes)
+		return fmt.Sprintf("%d分", max(int(remaining.Minutes()), 1))
 	}
 	hours := int(remaining.Hours())
 	if hours >= 24 {
-		return fmt.Sprintf("%d 天 %d 小时", hours/24, hours%24)
+		return fmt.Sprintf("%d天%d小时", hours/24, hours%24)
 	}
-	return fmt.Sprintf("%d 小时", hours)
+	return fmt.Sprintf("%d小时%d分", hours, int(remaining.Minutes())%60)
 }
 
-func createTrayIcon(actual accountQuota) syscall.Handle {
-	const size = 32
+// createTrayIcon renders the icon at exactly size×size pixels (the shell's
+// small-icon size) so the taskbar shows it 1:1 instead of resampling it.
+func createTrayIcon(actual accountQuota, size int) syscall.Handle {
 	dc, _, _ := procGetDC.Call(0)
 	info := bitmapInfo{Header: bitmapInfoHeader{
-		Size: uint32(unsafe.Sizeof(bitmapInfoHeader{})), Width: size, Height: -size,
-		Planes: 1, BitCount: 32, Compression: biRGB, SizeImage: size * size * 4,
+		Size: uint32(unsafe.Sizeof(bitmapInfoHeader{})), Width: int32(size), Height: -int32(size),
+		Planes: 1, BitCount: 32, Compression: biRGB, SizeImage: uint32(size * size * 4),
 	}}
-	var bits uintptr
+	var bits unsafe.Pointer
 	bitmap, _, _ := procCreateDIBSection.Call(dc, uintptr(unsafe.Pointer(&info)), dibRGBColors, uintptr(unsafe.Pointer(&bits)), 0, 0)
 	procReleaseDC.Call(0, dc)
-	if bitmap == 0 || bits == 0 {
+	if bitmap == 0 {
 		return 0
 	}
-	pixels := unsafe.Slice((*byte)(unsafe.Pointer(bits)), size*size*4)
-	drawIconMeter(pixels, size, 4, actual.Primary)
-	drawIconMeter(pixels, size, 18, actual.Secondary)
+	defer procDeleteObject.Call(bitmap)
+	if bits == nil {
+		return 0
+	}
+	drawTrayIconPixels(unsafe.Slice((*byte)(bits), size*size*4), size, actual)
 
-	maskBits := make([]byte, size*4)
-	mask, _, _ := procCreateBitmap.Call(size, size, 1, 1, uintptr(unsafe.Pointer(&maskBits[0])))
+	// Monochrome mask rows are padded to 16-bit boundaries; all zero means the
+	// color bitmap's alpha channel alone decides transparency.
+	maskBits := make([]byte, (size+15)/16*2*size)
+	mask, _, _ := procCreateBitmap.Call(uintptr(size), uintptr(size), 1, 1, uintptr(unsafe.Pointer(&maskBits[0])))
+	if mask == 0 {
+		return 0
+	}
+	defer procDeleteObject.Call(mask)
 	ii := iconInfo{Icon: 1, Mask: syscall.Handle(mask), Color: syscall.Handle(bitmap)}
 	icon, _, _ := procCreateIconIndirect.Call(uintptr(unsafe.Pointer(&ii)))
-	procDeleteObject.Call(mask)
-	procDeleteObject.Call(bitmap)
 	return syscall.Handle(icon)
 }
 
-func drawIconMeter(pixels []byte, size int, y int, bucket quotaBucket) {
-	track := colorRef(48, 59, 74)
-	fillRoundedPixels(pixels, size, 2, y, 28, 10, 3, track)
-	fillRoundedPixels(pixels, size, 4, y+2, 24, 6, 2, colorRef(21, 27, 37))
-	if !bucket.Known {
-		return
-	}
-	width := int(math.Round(float64(24) * float64(bucket.Percent) / 100.0))
-	if width > 0 {
-		fillRoundedPixels(pixels, size, 4, y+2, width, 6, 2, quotaColor(bucket.Percent))
+// drawTrayIconPixels lays out the two meters on the original 32px design grid
+// scaled to size, rounding every edge to a whole pixel so bars stay crisp.
+func drawTrayIconPixels(pixels []byte, size int, account accountQuota) {
+	grid := func(v int) int { return int(math.Round(float64(v*size) / 32)) }
+	trackX := max(grid(2), 1)
+	trackW := size - 2*trackX
+	trackH := grid(10)
+	inset := max(grid(2), 1)
+	for _, meter := range []struct {
+		top    int
+		bucket quotaBucket
+	}{{grid(4), account.Primary}, {grid(18), account.Secondary}} {
+		fillRoundedPixels(pixels, size, trackX, meter.top, trackW, trackH, trackH*3/10, colorRef(48, 59, 74))
+		innerX, innerY := trackX+inset, meter.top+inset
+		innerW, innerH := trackW-2*inset, trackH-2*inset
+		fillRoundedPixels(pixels, size, innerX, innerY, innerW, innerH, innerH/3, colorRef(21, 27, 37))
+		if !meter.bucket.Known {
+			continue
+		}
+		if width := int(math.Round(float64(innerW) * float64(meter.bucket.Percent) / 100.0)); width > 0 {
+			fillRoundedPixels(pixels, size, innerX, innerY, width, innerH, innerH/3, quotaColor(meter.bucket.Percent))
+		}
 	}
 }
 
@@ -1630,7 +2020,7 @@ func fillRoundedPixels(pixels []byte, size, left, top, width, height, radius int
 				cy = float64(top + height - radius - 1)
 			}
 			dx, dy := float64(x)-cx, float64(y)-cy
-			if dx*dx+dy*dy > r*r {
+			if dx*dx+dy*dy > r*r || x < 0 || y < 0 || x >= size || y >= size {
 				continue
 			}
 			i := (y*size + x) * 4
@@ -1648,7 +2038,7 @@ type responseEnvelope struct {
 }
 
 type directResponseEnvelope struct {
-	Accounts map[string]json.RawMessage `json:"accounts"`
+	Accounts json.RawMessage `json:"accounts"`
 }
 
 type quotaResetResponse struct {
@@ -1687,39 +2077,132 @@ type quotaBucketRaw struct {
 	ResetTimeSnake    string   "json:\"reset_time\""
 }
 
-func fetchQuota() (quotaSnapshot, error) {
+type quotaEndpoints struct {
+	quota       string
+	direct      string
+	reset       string
+	directReset string
+}
+
+// quotaEndpointsFor builds the plugin routes under the configured CPA base
+// URL. Credentials are only ever sent over HTTPS, or plain HTTP to loopback.
+func quotaEndpointsFor(serverURL string) (quotaEndpoints, error) {
+	base := strings.TrimSpace(serverURL)
+	if base == "" {
+		base = defaultServerURL
+	}
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return quotaEndpoints{}, fmt.Errorf("设置中的 ServerURL 无效：%q", serverURL)
+	}
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+		return quotaEndpoints{}, fmt.Errorf("设置中的 ServerURL 必须使用 HTTPS（仅本机地址允许 HTTP）：%q", serverURL)
+	}
+	root := strings.TrimRight(parsed.Scheme+"://"+parsed.Host+parsed.EscapedPath(), "/") + quotaRoutePath
+	return quotaEndpoints{
+		quota:       root,
+		direct:      root + "/direct",
+		reset:       root + "/reset",
+		directReset: root + "/direct/reset",
+	}, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func userAgent() string {
+	return "CPA-Quota-Query/" + appVersion
+}
+
+// newQuotaClient does not follow redirects, so credentials are never replayed
+// to another location; a redirect surfaces as an HTTP status error instead.
+func newQuotaClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Timeout:   12 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+type httpStatusError struct {
+	operation string
+	code      int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s返回 HTTP %d", e.operation, e.code)
+}
+
+// quotaRetryError wraps the last failure after more than one attempt.
+type quotaRetryError struct {
+	attempts int
+	err      error
+}
+
+func (e *quotaRetryError) Error() string {
+	return fmt.Sprintf("额度查询连续失败（共尝试 %d 次）：%v", e.attempts, e.err)
+}
+
+func (e *quotaRetryError) Unwrap() error {
+	return e.err
+}
+
+// quotaFailureCause strips the retry wrapper so short status lines show the
+// actual reason rather than the attempt count.
+func quotaFailureCause(err error) error {
+	var retryErr *quotaRetryError
+	if errors.As(err, &retryErr) {
+		return retryErr.err
+	}
+	return err
+}
+
+// retryableQuotaError reports whether another attempt could succeed. Client
+// errors such as 401/403/404 will not change on retry.
+func retryableQuotaError(err error) bool {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.code == http.StatusRequestTimeout || statusErr.code == http.StatusTooManyRequests || statusErr.code >= 500
+	}
+	return true
+}
+
+func fetchQuota(serverURL string) (quotaSnapshot, error) {
+	endpoints, err := quotaEndpointsFor(serverURL)
+	if err != nil {
+		return quotaSnapshot{}, err
+	}
 	credentials, err := readQuotaCredentials()
 	if err != nil {
 		return quotaSnapshot{}, err
 	}
-	client := &http.Client{Timeout: 12 * time.Second}
+	client := newQuotaClient(nil)
 	return fetchQuotaWithRetry(func() (quotaSnapshot, error) {
-		return fetchQuotaUsingAuth(client, credentials, apiURL, directAPIURL)
+		return fetchQuotaUsingAuth(client, credentials, endpoints.quota, endpoints.direct)
 	}, time.Sleep)
 }
 
 func fetchQuotaWithRetry(request func() (quotaSnapshot, error), sleep func(time.Duration)) (quotaSnapshot, error) {
-	var lastErr error
-	for attempt := 0; attempt <= quotaRequestRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		result, err := request()
 		if err == nil {
 			return result, nil
 		}
-		lastErr = err
-		if attempt == quotaRequestRetries {
-			break
+		if attempt == quotaRequestRetries || !retryableQuotaError(err) {
+			if attempt == 0 {
+				return quotaSnapshot{}, err
+			}
+			return quotaSnapshot{}, &quotaRetryError{attempts: attempt + 1, err: err}
 		}
-		delay := time.Second << attempt
-		if delay > 8*time.Second {
-			delay = 8 * time.Second
-		}
-		sleep(delay)
+		sleep(min(time.Second<<attempt, 8*time.Second))
 	}
-	return quotaSnapshot{}, fmt.Errorf("额度查询连续失败（共尝试 %d 次）：%w", quotaRequestRetries+1, lastErr)
-}
-
-func fetchQuotaOnce(client *http.Client, apiKey string) (quotaSnapshot, error) {
-	return fetchQuotaAt(client, apiURL, apiKey)
 }
 
 func fetchQuotaUsingAuth(client *http.Client, credentials quotaCredentials, apiKeyEndpoint, chatGPTEndpoint string) (quotaSnapshot, error) {
@@ -1739,7 +2222,7 @@ func fetchQuotaAt(client *http.Client, endpoint, apiKey string) (quotaSnapshot, 
 	if err != nil {
 		return result, err
 	}
-	req.Header.Set("User-Agent", "QuotaTrayMonitor/1.0")
+	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1747,10 +2230,10 @@ func fetchQuotaAt(client *http.Client, endpoint, apiKey string) (quotaSnapshot, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return result, fmt.Errorf("额度接口返回 HTTP %d", resp.StatusCode)
+		return result, &httpStatusError{operation: "额度接口", code: resp.StatusCode}
 	}
 	var envelope responseEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxQuotaResponseBytes)).Decode(&envelope); err != nil {
 		return result, fmt.Errorf("解析额度响应失败：%w", err)
 	}
 	return parseQuotaEnvelope(envelope), nil
@@ -1768,65 +2251,36 @@ func fetchDirectQuotaAt(client *http.Client, endpoint, accessToken, accountID st
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return quotaSnapshot{}, fmt.Errorf("直接额度接口返回 HTTP %d", resp.StatusCode)
+		return quotaSnapshot{}, &httpStatusError{operation: "直接额度接口", code: resp.StatusCode}
 	}
 	var envelope directResponseEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxQuotaResponseBytes)).Decode(&envelope); err != nil {
 		return quotaSnapshot{}, fmt.Errorf("解析直接额度响应失败：%w", err)
 	}
 	return parseDirectQuotaEnvelope(envelope)
 }
 
 func parseQuotaEnvelope(envelope responseEnvelope) quotaSnapshot {
-	nominalCount := countAccounts(envelope.Nominal)
-	actualCount := countAccounts(envelope.Actual)
+	nominal := parseAccounts(envelope.Nominal)
 	return quotaSnapshot{
-		Nominal:          parseAccount(envelope.Nominal),
-		Actual:           parseAccount(envelope.Actual),
-		NominalAvailable: nominalCount > 0,
-		ActualAvailable:  actualCount > 0,
-		SingleAccount:    nominalCount+actualCount == 1,
-		ResetSupported:   true,
+		Nominal:        nominal,
+		Actual:         parseAccounts(envelope.Actual),
+		ResetSupported: len(nominal) > 0,
 	}
 }
 
 func parseDirectQuotaEnvelope(envelope directResponseEnvelope) (quotaSnapshot, error) {
-	if len(envelope.Accounts) == 0 {
+	accounts := parseAccounts(envelope.Accounts)
+	if len(accounts) == 0 {
 		return quotaSnapshot{}, errors.New("直接额度响应中没有账户数据")
 	}
-	accountsJSON, err := json.Marshal(envelope.Accounts)
-	if err != nil {
-		return quotaSnapshot{}, errors.New("解析直接额度账户数据失败")
-	}
-	return quotaSnapshot{
-		Nominal:          parseAccount(accountsJSON),
-		NominalAvailable: true,
-		SingleAccount:    len(envelope.Accounts) == 1,
-		DirectMode:       true,
-		ResetSupported:   true,
-	}, nil
+	return quotaSnapshot{Nominal: accounts, DirectMode: true, ResetSupported: true}, nil
 }
 
 func setDirectQuotaHeaders(req *http.Request, accessToken, accountID string) {
-	req.Header.Set("User-Agent", "QuotaTrayMonitor/1.0")
+	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("ChatGPT-Account-ID", accountID)
-}
-
-func hasActualAccounts(raw json.RawMessage) bool {
-	return countAccounts(raw) > 0
-}
-
-func countAccounts(raw json.RawMessage) int {
-	value := bytes.TrimSpace(raw)
-	if len(value) == 0 || value[0] != '{' {
-		return 0
-	}
-	var accounts map[string]json.RawMessage
-	if err := json.Unmarshal(value, &accounts); err != nil {
-		return 0
-	}
-	return len(accounts)
 }
 
 type quotaCredentials struct {
@@ -1888,18 +2342,11 @@ func parseQuotaCredentials(authBytes []byte) (quotaCredentials, error) {
 	}
 }
 
-func readDownstreamAPIKey() (string, error) {
-	credentials, err := readQuotaCredentials()
+func requestQuotaReset(serverURL string) (string, error) {
+	endpoints, err := quotaEndpointsFor(serverURL)
 	if err != nil {
 		return "", err
 	}
-	if credentials.Mode != authModeAPIKey {
-		return "", errors.New("当前 auth_mode 不支持 CPA API Key 重置接口")
-	}
-	return credentials.APIKey, nil
-}
-
-func requestQuotaReset() (string, error) {
 	credentials, err := readQuotaCredentials()
 	if err != nil {
 		return "", err
@@ -1908,18 +2355,13 @@ func requestQuotaReset() (string, error) {
 	if !ok {
 		return "", errors.New("无法创建单次重置请求")
 	}
+	// No connection reuse and no HTTP/2, so the transport can never silently
+	// replay this side-effecting GET on a stale connection.
 	transport := defaultTransport.Clone()
 	transport.DisableKeepAlives = true
 	transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 	defer transport.CloseIdleConnections()
-	client := &http.Client{
-		Timeout:   12 * time.Second,
-		Transport: transport,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-	return requestQuotaResetWithAuth(client, credentials, resetAPIURL, directResetAPIURL)
+	return requestQuotaResetWithAuth(newQuotaClient(transport), credentials, endpoints.reset, endpoints.directReset)
 }
 
 func requestQuotaResetWithAuth(client *http.Client, credentials quotaCredentials, apiKeyEndpoint, chatGPTEndpoint string) (string, error) {
@@ -1931,7 +2373,7 @@ func requestQuotaResetWithAuth(client *http.Client, credentials quotaCredentials
 	case authModeAPIKey:
 		req, err = http.NewRequest(http.MethodGet, endpoint, nil)
 		if err == nil {
-			req.Header.Set("User-Agent", "QuotaTrayMonitor/1.0")
+			req.Header.Set("User-Agent", userAgent())
 			req.Header.Set("Authorization", "Bearer "+credentials.APIKey)
 		}
 	case authModeChatGPT:
@@ -2044,29 +2486,36 @@ func localizeResetMessage(message string) string {
 	}
 }
 
-func parseAccount(raw json.RawMessage) accountQuota {
-	account := accountQuota{Email: "未知"}
-	if len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
-		return account
+// parseAccounts reads an {"email": details, ...} object, keeping the server's
+// account order. Anything other than a non-empty object yields no accounts.
+func parseAccounts(raw json.RawMessage) []accountQuota {
+	value := bytes.TrimSpace(raw)
+	if len(value) == 0 || value[0] != '{' {
+		return nil
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder := json.NewDecoder(bytes.NewReader(value))
 	if _, err := decoder.Token(); err != nil {
-		return account
+		return nil
 	}
-	if !decoder.More() {
-		return account
+	var accounts []accountQuota
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		email, _ := keyToken.(string)
+		var details accountDetails
+		if err := decoder.Decode(&details); err != nil {
+			accounts = append(accounts, accountQuota{Email: email})
+			break
+		}
+		accounts = append(accounts, accountFromDetails(email, details))
 	}
-	keyToken, err := decoder.Token()
-	if err != nil {
-		return account
-	}
-	email, _ := keyToken.(string)
-	account.Email = email
-	var details accountDetails
-	if err := decoder.Decode(&details); err != nil {
-		return account
-	}
-	account.Reset = details.ResetCredits
+	return accounts
+}
+
+func accountFromDetails(email string, details accountDetails) accountQuota {
+	account := accountQuota{Email: email, Reset: details.ResetCredits}
 	for _, group := range details.Groups {
 		if group.DisplayName == "Codex" || !account.Primary.Known {
 			for _, bucket := range group.Buckets {
@@ -2116,23 +2565,96 @@ func quotaRemainingText(bucket quotaBucket, now time.Time) string {
 	if bucket.ResetAt.IsZero() {
 		return "剩余时间：--"
 	}
-	remaining := bucket.ResetAt.Sub(now)
-	if remaining <= 0 {
-		return "剩余时间：已到期"
-	}
-	if remaining < time.Hour {
-		minutes := int(remaining.Minutes())
-		if minutes < 1 {
-			minutes = 1
+	return "剩余时间：" + formatRemaining(bucket.ResetAt.Sub(now))
+}
+
+type quotaRecoveryNotice struct {
+	title string
+	text  string
+}
+
+type exhaustedWindow struct {
+	email   string
+	window  string
+	label   string
+	resetAt time.Time
+}
+
+// quotaRecoveryTracker remembers nominal-account windows seen at 0% and
+// reports each one once when its reset time passes.
+type quotaRecoveryTracker struct {
+	exhausted map[string]exhaustedWindow
+	announced map[string]time.Time
+}
+
+func newQuotaRecoveryTracker() *quotaRecoveryTracker {
+	return &quotaRecoveryTracker{exhausted: map[string]exhaustedWindow{}, announced: map[string]time.Time{}}
+}
+
+// update records exhausted windows from the latest nominal accounts and
+// returns notices for those whose reset time is now due. A window that comes
+// back above 0% before its reset time (for example after consuming a reset
+// credit) is dropped without a notice.
+func (t *quotaRecoveryTracker) update(accounts []accountQuota, now time.Time) []quotaRecoveryNotice {
+	for _, account := range accounts {
+		for _, window := range []struct {
+			key, label string
+			bucket     quotaBucket
+		}{{"primary", "5h", account.Primary}, {"secondary", "周", account.Secondary}} {
+			key := account.Email + "\x00" + window.key
+			bucket := window.bucket
+			switch {
+			case !bucket.Known:
+			case bucket.Percent == 0 && !bucket.ResetAt.IsZero():
+				if announced, ok := t.announced[key]; !ok || !announced.Equal(bucket.ResetAt) {
+					t.exhausted[key] = exhaustedWindow{email: account.Email, window: window.key, label: window.label, resetAt: bucket.ResetAt}
+				}
+			case bucket.Percent > 0:
+				if pending, ok := t.exhausted[key]; ok && pending.resetAt.After(now) {
+					delete(t.exhausted, key)
+				}
+			}
 		}
-		return fmt.Sprintf("剩余时间：%d分", minutes)
 	}
-	hours := int(remaining.Hours())
-	if hours >= 24 {
-		return fmt.Sprintf("剩余时间：%d天%d小时", hours/24, hours%24)
+
+	var due []exhaustedWindow
+	for key, pending := range t.exhausted {
+		if !pending.resetAt.After(now) {
+			due = append(due, pending)
+			t.announced[key] = pending.resetAt
+			delete(t.exhausted, key)
+		}
 	}
-	minutes := int(remaining.Minutes()) % 60
-	return fmt.Sprintf("剩余时间：%d小时%d分", hours, minutes)
+	sort.Slice(due, func(i, j int) bool {
+		if due[i].email != due[j].email {
+			return due[i].email < due[j].email
+		}
+		return due[i].window < due[j].window
+	})
+	var notices []quotaRecoveryNotice
+	for i := 0; i < len(due); {
+		j, labels := i, []string{}
+		for ; j < len(due) && due[j].email == due[i].email; j++ {
+			labels = append(labels, due[j].label)
+		}
+		notices = append(notices, quotaRecoveryNotice{
+			title: strings.Join(labels, "/") + "额度已恢复",
+			text:  accountEmail(accountQuota{Email: due[i].email}) + " 已到达重置时间",
+		})
+		i = j
+	}
+	return notices
+}
+
+// nextDue returns the earliest pending reset time, or zero if none.
+func (t *quotaRecoveryTracker) nextDue() time.Time {
+	var next time.Time
+	for _, pending := range t.exhausted {
+		if next.IsZero() || pending.resetAt.Before(next) {
+			next = pending.resetAt
+		}
+	}
+	return next
 }
 
 func nextQuotaExpiry(quota quotaSnapshot, now, handledThrough time.Time) (time.Time, bool) {
@@ -2150,13 +2672,13 @@ func nextQuotaExpiry(quota quotaSnapshot, now, handledThrough time.Time) (time.T
 			next = at
 		}
 	}
-	consider(quota.Nominal.Primary.ResetAt)
-	consider(quota.Nominal.Secondary.ResetAt)
-	consider(quota.Actual.Primary.ResetAt)
-	consider(quota.Actual.Secondary.ResetAt)
-	for _, info := range []resetCreditInfo{quota.Nominal.Reset, quota.Actual.Reset} {
-		for _, raw := range info.ExpiresAt {
-			consider(parseQuotaResetTime(raw))
+	for _, accounts := range [][]accountQuota{quota.Nominal, quota.Actual} {
+		for _, account := range accounts {
+			consider(account.Primary.ResetAt)
+			consider(account.Secondary.ResetAt)
+			for _, raw := range account.Reset.ExpiresAt {
+				consider(parseQuotaResetTime(raw))
+			}
 		}
 	}
 	return next, expired
@@ -2190,6 +2712,7 @@ func loadSettings() appSettings {
 		settings.RefreshMinutes = 10
 	}
 	settings.ThemeMode = normalizedThemeMode(settings.ThemeMode)
+	settings.ServerURL = strings.TrimSpace(settings.ServerURL)
 	return settings
 }
 
@@ -2220,8 +2743,8 @@ func saveSettings(settings appSettings) {
 }
 
 func startupEnabled() bool {
-	keyPath, _ := syscall.UTF16PtrFromString("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-	valueName, _ := syscall.UTF16PtrFromString("CodexQuotaTrayMonitor")
+	keyPath := utf16Ptr("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+	valueName := utf16Ptr("CodexQuotaTrayMonitor")
 	var key uintptr
 	r, _, _ := procRegOpenKeyEx.Call(hkeyCurrentUser, uintptr(unsafe.Pointer(keyPath)), 0, keyQueryValue, uintptr(unsafe.Pointer(&key)))
 	if r != 0 {
@@ -2234,8 +2757,8 @@ func startupEnabled() bool {
 }
 
 func setStartup(enabled bool) error {
-	keyPath, _ := syscall.UTF16PtrFromString("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-	valueName, _ := syscall.UTF16PtrFromString("CodexQuotaTrayMonitor")
+	keyPath := utf16Ptr("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+	valueName := utf16Ptr("CodexQuotaTrayMonitor")
 	var key uintptr
 	r, _, _ := procRegCreateKeyEx.Call(
 		hkeyCurrentUser, uintptr(unsafe.Pointer(keyPath)), 0, 0, 0,
@@ -2256,7 +2779,7 @@ func setStartup(enabled bool) error {
 	if err != nil {
 		return err
 	}
-	command, _ := syscall.UTF16FromString("\"" + executable + "\"")
+	command := utf16Text("\"" + executable + "\"")
 	r, _, _ = procRegSetValueEx.Call(
 		key, uintptr(unsafe.Pointer(valueName)), 0, regSZ,
 		uintptr(unsafe.Pointer(&command[0])), uintptr(uint32(len(command)*2)),
@@ -2276,18 +2799,10 @@ func winError(operation string) error {
 }
 
 func showError(message string) {
-	showMessageBox(0, message, 0x10)
+	showMessageBox(0, message, mbIconError)
 }
 
 func showMessageBox(owner syscall.Handle, message string, flags uintptr) int32 {
-	text, _ := syscall.UTF16PtrFromString(message)
-	title, _ := syscall.UTF16PtrFromString(windowName)
-	result, _, _ := procMessageBox.Call(uintptr(owner), uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)), flags)
+	result, _, _ := procMessageBox.Call(uintptr(owner), uintptr(unsafe.Pointer(utf16Ptr(message))), uintptr(unsafe.Pointer(utf16Ptr(windowName))), flags)
 	return int32(result)
 }
-
-func init() {
-	// Windows build intentionally uses only the Go standard library and Win32 APIs.
-}
-
-var procInvalidateRect = user32.NewProc("InvalidateRect")
