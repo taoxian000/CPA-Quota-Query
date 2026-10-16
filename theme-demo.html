@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>额度监控主题 Demo v1.6</title>
+<style>
+  :root {
+    --bg:#17181C; --card:#20222A; --border:#2E313A; --text:#ECEDF1; --sub:#9AA0AD; --btn:#2A2D36;
+    --claude:#D97757; --codex:#8B5CF6; --anti:#3FA9F5; --anti2:#27D3C4;
+    --warn:#F2C037; --danger:#E5484D;
+    --on-claude:#fff; --on-codex:#fff; --on-anti:#0B1220;
+  }
+  body.light {
+    --bg:#F6F5F2; --card:#FFFFFF; --border:#E3E1DA; --text:#1F2024; --sub:#6B6F7A; --btn:#ECEAE4;
+    --claude:#C4623F; --codex:#6D3FE0; --anti:#1F86D6; --anti2:#0FA89B;
+    --on-anti:#fff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:flex; flex-direction:column; align-items:center;
+         padding:32px 16px; background:#0c0d10; font:14px "Microsoft YaHei UI","Microsoft YaHei",sans-serif; transition:background .2s; }
+  body.light { background:#dcdad3; }
+  .toolbar { margin-bottom:16px; display:flex; gap:8px; }
+  .toolbar button { padding:6px 14px; border:1px solid #888; border-radius:6px; background:transparent;
+                    color:#aaa; cursor:pointer; font:inherit; }
+  body.light .toolbar button { color:#444; }
+
+  /* 面板宽 540，卡片左右各留 14，与程序一致 */
+  .panel { width:540px; background:var(--bg); border:1px solid var(--border);
+           padding:0 14px 14px; display:flex; flex-direction:column; gap:10px; color:var(--text);
+           box-shadow:0 8px 30px rgba(0,0,0,.35); }
+  .head { height:46px; display:flex; align-items:center; gap:8px; padding:0 4px; margin:0 -14px 0; padding:0 18px; }
+  .head b { font-size:15px; font-weight:500; }
+  .head .status { flex:1; color:var(--sub); font-size:13px; margin-left:10px; }
+  .head .btn { height:30px; min-width:30px; padding:0 12px; display:grid; place-items:center; font-size:13px;
+               background:var(--btn); border:1px solid var(--border); border-radius:6px; color:var(--text); }
+  .head .btn.on { background:#3F8BD6; color:#fff; }
+
+  /* ---- 公共骨架：三家结构完全一致，只有配色（及 Claude 的衬线标题、Antigravity 的渐变）不同 ---- */
+  .card { --accent:var(--claude); --on:var(--on-claude);
+          background:color-mix(in srgb, var(--accent) 9%, var(--card));
+          border:1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+          border-radius:16px; overflow:hidden; }
+  .title { height:30px; display:flex; align-items:center; padding:0 10px; gap:8px;
+           background:var(--accent); color:var(--on); }
+  .title .badge { width:20px; height:20px; display:grid; place-items:center; }
+  .title .badge svg { width:20px; height:20px; fill:currentColor; }
+  .title b { width:110px; font-size:14px; font-weight:700; }
+  .title small { flex:1; font-size:13px; text-align:right; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .body { padding:14px 13px 12px; }
+  .groupname { font-size:14px; height:20px; line-height:20px; margin-bottom:4px; }
+  .groupname + .meter { margin-top:0; }
+  .group + .group { margin-top:10px; }         /* Antigravity 两组额度之间的额外间距 */
+  .meter { display:grid; grid-template-columns:54px 171px 56px 1fr; column-gap:10px; align-items:center;
+           height:24px; font-size:14px; }
+  .meter .lbl { color:var(--sub); }
+  .meter .pct { margin-left:-2px; }
+  .meter .pct.warn { color:var(--warn); } .meter .pct.danger { color:var(--danger); }
+  .meter .rem { color:var(--sub); white-space:nowrap; }
+  .track { height:12px; background:color-mix(in srgb, var(--accent) 18%, color-mix(in srgb, var(--accent) 9%, var(--card)));
+           border-radius:6px; overflow:hidden; }
+  .fill { height:100%; background:var(--accent); border-radius:6px; }
+  .fill.warn { background:var(--warn); } .fill.danger { background:var(--danger); }
+
+  /* ---- Claude：衬线标题、暖色 ---- */
+  .claude .title b { font-family:Georgia,"Songti SC","SimSun",serif; font-size:16px; }
+
+  /* ---- Codex：只有紫色，其余同 Claude；多出重置次数区 ---- */
+  .card.codex { --accent:var(--codex); --on:var(--on-codex); }
+  .divider { height:1px; background:var(--border); margin:11px 0 3px; }
+  .resets { position:relative; }
+  .resets .count { height:23px; line-height:23px; font-size:14px; }
+  .resets .line { height:20px; line-height:19px; font-size:13px; color:var(--sub); }
+  .resets .refresh { position:absolute; right:0; top:50%; transform:translateY(-50%); width:34px; height:34px;
+                     display:grid; place-items:center; background:var(--btn); border:1px solid var(--border);
+                     border-radius:6px; color:var(--text); }
+
+  /* ---- Antigravity：渐变标题、菱形徽标，圆角 12 ---- */
+  .card.anti { --accent:var(--anti); --on:var(--on-anti); border-radius:12px; }
+  .anti .title { background:linear-gradient(90deg, var(--anti), var(--anti2)); }
+  .anti .track { height:8px; border-radius:4px; } .anti .fill { border-radius:4px; }
+  .anti .fill:not(.warn):not(.danger) { background:linear-gradient(90deg, var(--anti), var(--anti2)); }
+
+  /* ---- 未连接占位卡 ---- */
+  .card.off { --accent:var(--border); background:var(--card); }
+  .off .title { background:var(--border); color:var(--sub); }
+  .off .msg { padding:0 13px; height:42px; line-height:42px; color:var(--sub); font-size:14px; }
+
+  .legend { margin-top:14px; color:#888; font-size:12px; text-align:center; max-width:540px; line-height:1.6; }
+</style>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true"><symbol id="ic-claude" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M4.709 15.955l4.72-2.647.08-.23-.08-.128H9.2l-.79-.048-2.698-.073-2.339-.097-2.266-.122-.571-.121L0 11.784l.055-.352.48-.321.686.06 1.52.103 2.278.158 1.652.097 2.449.255h.389l.055-.157-.134-.098-.103-.097-2.358-1.596-2.552-1.688-1.336-.972-.724-.491-.364-.462-.158-1.008.656-.722.881.06.225.061.893.686 1.908 1.476 2.491 1.833.365.304.145-.103.019-.073-.164-.274-1.355-2.446-1.446-2.49-.644-1.032-.17-.619a2.97 2.97 0 01-.104-.729L6.283.134 6.696 0l.996.134.42.364.62 1.414 1.002 2.229 1.555 3.03.456.898.243.832.091.255h.158V9.01l.128-1.706.237-2.095.23-2.695.08-.76.376-.91.747-.492.584.28.48.685-.067.444-.286 1.851-.559 2.903-.364 1.942h.212l.243-.242.985-1.306 1.652-2.064.73-.82.85-.904.547-.431h1.033l.76 1.129-.34 1.166-1.064 1.347-.881 1.142-1.264 1.7-.79 1.36.073.11.188-.02 2.856-.606 1.543-.28 1.841-.315.833.388.091.395-.328.807-1.969.486-2.309.462-3.439.813-.042.03.049.061 1.549.146.662.036h1.622l3.02.225.79.522.474.638-.079.485-1.215.62-1.64-.389-3.829-.91-1.312-.329h-.182v.11l1.093 1.068 2.006 1.81 2.509 2.33.127.578-.322.455-.34-.049-2.205-1.657-.851-.747-1.926-1.62h-.128v.17l.444.649 2.345 3.521.122 1.08-.17.353-.608.213-.668-.122-1.374-1.925-1.415-2.167-1.143-1.943-.14.08-.674 7.254-.316.37-.729.28-.607-.461-.322-.747.322-1.476.389-1.924.315-1.53.286-1.9.17-.632-.012-.042-.14.018-1.434 1.967-2.18 2.945-1.726 1.845-.414.164-.717-.37.067-.662.401-.589 2.388-3.036 1.44-1.882.93-1.086-.006-.158h-.055L4.132 18.56l-1.13.146-.487-.456.061-.746.231-.243 1.908-1.312-.006.006z"/></symbol><symbol id="ic-codex" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M8.086.457a6.105 6.105 0 013.046-.415c1.333.153 2.521.72 3.564 1.7a.117.117 0 00.107.029c1.408-.346 2.762-.224 4.061.366l.063.03.154.076c1.357.703 2.33 1.77 2.918 3.198.278.679.418 1.388.421 2.126a5.655 5.655 0 01-.18 1.631.167.167 0 00.04.155 5.982 5.982 0 011.578 2.891c.385 1.901-.01 3.615-1.183 5.14l-.182.22a6.063 6.063 0 01-2.934 1.851.162.162 0 00-.108.102c-.255.736-.511 1.364-.987 1.992-1.199 1.582-2.962 2.462-4.948 2.451-1.583-.008-2.986-.587-4.21-1.736a.145.145 0 00-.14-.032c-.518.167-1.04.191-1.604.185a5.924 5.924 0 01-2.595-.622 6.058 6.058 0 01-2.146-1.781c-.203-.269-.404-.522-.551-.821a7.74 7.74 0 01-.495-1.283 6.11 6.11 0 01-.017-3.064.166.166 0 00.008-.074.115.115 0 00-.037-.064 5.958 5.958 0 01-1.38-2.202 5.196 5.196 0 01-.333-1.589 6.915 6.915 0 01.188-2.132c.45-1.484 1.309-2.648 2.577-3.493.282-.188.55-.334.802-.438.286-.12.573-.22.861-.304a.129.129 0 00.087-.087A6.016 6.016 0 015.635 2.31C6.315 1.464 7.132.846 8.086.457zm-.804 7.85a.848.848 0 00-1.473.842l1.694 2.965-1.688 2.848a.849.849 0 001.46.864l1.94-3.272a.849.849 0 00.007-.854l-1.94-3.393zm5.446 6.24a.849.849 0 000 1.695h4.848a.849.849 0 000-1.696h-4.848z"/></symbol><symbol id="ic-antigravity" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M21.751 22.607c1.34 1.005 3.35.335 1.508-1.508C17.73 15.74 18.904 1 12.037 1 5.17 1 6.342 15.74.815 21.1c-2.01 2.009.167 2.511 1.507 1.506 5.192-3.517 4.857-9.714 9.715-9.714 4.857 0 4.522 6.197 9.714 9.715z"/></symbol></svg>
+  <div class="toolbar">
+    <button onclick="document.body.classList.remove('light')">深色</button>
+    <button onclick="document.body.classList.add('light')">浅色</button>
+  </div>
+
+  <div class="panel">
+    <div class="head">
+      <b>额度监控</b><span class="status">更新于 21:44:20</span>
+      <span class="btn">跟随系统</span><span class="btn on">📌</span><span class="btn">—</span><span class="btn">×</span>
+    </div>
+
+    <!-- Codex：账户行为「邮箱 · Plus」，格式与另两家一致 -->
+    <div class="card codex">
+      <div class="title"><div class="badge"><svg viewBox="0 0 24 24"><use href="#ic-codex"/></svg></div><b>Codex</b><small>user@example.com  ·  Plus</small></div>
+      <div class="body">
+        <div class="meter"><span class="lbl">5小时</span><div class="track"><div class="fill" style="width:78%"></div></div><span class="pct">78%</span><span class="rem">剩余时间：2小时30分</span></div>
+        <div class="meter"><span class="lbl">周额度</span><div class="track"><div class="fill" style="width:91%"></div></div><span class="pct">91%</span><span class="rem">剩余时间：5天18小时</span></div>
+        <div class="divider"></div>
+        <div class="resets">
+          <div class="count">重置次数  ·  3 次</div>
+          <div class="line">到期 2026-10-23 03:10  ·  剩余 6天5小时</div>
+          <div class="line">到期 2026-10-30 01:21  ·  剩余 13天3小时</div>
+          <div class="line">到期 2026-11-07 06:16  ·  剩余 21天8小时</div>
+          <div class="refresh">↻</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Antigravity：两组额度之间间距加大 -->
+    <div class="card anti">
+      <div class="title"><div class="badge"><svg viewBox="0 0 24 24"><use href="#ic-antigravity"/></svg></div><b>Antigravity</b><small>user@example.com  ·  Google AI Pro</small></div>
+      <div class="body">
+        <div class="group">
+          <div class="groupname">Gemini Models</div>
+          <div class="meter"><span class="lbl">5小时</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="pct">100%</span><span class="rem">剩余时间：3小时3分</span></div>
+          <div class="meter"><span class="lbl">周额度</span><div class="track"><div class="fill" style="width:97%"></div></div><span class="pct">97%</span><span class="rem">剩余时间：6天11小时</span></div>
+        </div>
+        <div class="group">
+          <div class="groupname">Claude and GPT models</div>
+          <div class="meter"><span class="lbl">5小时</span><div class="track"><div class="fill" style="width:100%"></div></div><span class="pct">100%</span><span class="rem">剩余时间：4小时59分</span></div>
+          <div class="meter"><span class="lbl">周额度</span><div class="track"><div class="fill" style="width:24%"></div></div><span class="pct warn">! 24%</span><span class="rem">剩余时间：1天17小时</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card claude">
+      <div class="title"><div class="badge"><svg viewBox="0 0 24 24"><use href="#ic-claude"/></svg></div><b>Claude</b><small>user@example.com  ·  Max</small></div>
+      <div class="body">
+        <div class="meter"><span class="lbl">5小时</span><div class="track"><div class="fill" style="width:72%"></div></div><span class="pct">72%</span><span class="rem">剩余时间：2小时14分</span></div>
+        <div class="meter"><span class="lbl">周额度</span><div class="track"><div class="fill danger" style="width:6%"></div></div><span class="pct danger">! 6%</span><span class="rem">剩余时间：3天2小时</span></div>
+      </div>
+    </div>
+
+    <div class="card claude off">
+      <div class="title"><div class="badge"><svg viewBox="0 0 24 24"><use href="#ic-claude"/></svg></div><b>Claude</b><small>user@example.com</small></div>
+      <div class="msg">未连接  ·  等待首次同步</div>
+    </div>
+  </div>
+
+  <div class="legend">
+    三家布局完全一致（标题栏 30px、首条额度条距标题 14px、行距 24px、额度条 12px 圆角），仅配色不同；Claude 用衬线标题，Antigravity 用渐变标题 + 细条，Codex 额外带重置次数区。<br>
+    图标均为各产品官方标志。<br>额度低于 30% 变黄、低于 10% 变红，并带 “!”。
+  </div>
+</body>
+</html>

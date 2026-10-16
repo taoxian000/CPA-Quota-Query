@@ -396,7 +396,6 @@ type providerStyle struct {
 	face                      string
 	segmented, gradient       bool
 	barHeight                 int32
-	badge                     string
 }
 
 func styleFor(id string, dark bool) providerStyle {
@@ -407,10 +406,10 @@ func styleFor(id string, dark bool) providerStyle {
 			accent = colorRef(217, 119, 87)
 		}
 		return providerStyle{accent: accent, accent2: accent, onAccent: colorRef(255, 255, 255),
-			radius: 16, face: "Georgia", barHeight: 12, badge: "C"}
+			radius: 16, face: "Georgia", barHeight: 12}
 	case providerAntigravity:
 		style := providerStyle{accent: colorRef(31, 134, 214), accent2: colorRef(15, 168, 155), onAccent: colorRef(255, 255, 255),
-			radius: 12, face: "Microsoft YaHei UI", gradient: true, barHeight: 8, badge: "A"}
+			radius: 12, face: "Microsoft YaHei UI", gradient: true, barHeight: 8}
 		if dark {
 			style.accent, style.accent2, style.onAccent = colorRef(63, 169, 245), colorRef(39, 211, 196), colorRef(11, 18, 32)
 		}
@@ -421,7 +420,7 @@ func styleFor(id string, dark bool) providerStyle {
 			accent = colorRef(139, 92, 246)
 		}
 		return providerStyle{accent: accent, accent2: accent, onAccent: colorRef(255, 255, 255),
-			radius: 16, face: "Microsoft YaHei UI", barHeight: 12, badge: ">_"}
+			radius: 16, face: "Microsoft YaHei UI", barHeight: 12}
 	}
 }
 
@@ -522,19 +521,6 @@ func drawGradientRound(hdc uintptr, b rect, radius int32, c1, c2 uint32, squareB
 	}
 }
 
-func drawDiamond(hdc uintptr, cx, cy, half int32, fill uint32) {
-	points := [4]point{{X: cx, Y: cy - half}, {X: cx + half, Y: cy}, {X: cx, Y: cy + half}, {X: cx - half, Y: cy}}
-	brush := createBrush(fill)
-	pen, _, _ := procCreatePen.Call(0, 1, uintptr(fill))
-	oldBrush, _, _ := procSelectObject.Call(hdc, uintptr(brush))
-	oldPen, _, _ := procSelectObject.Call(hdc, pen)
-	procPolygon.Call(hdc, uintptr(unsafe.Pointer(&points[0])), uintptr(len(points)))
-	procSelectObject.Call(hdc, oldPen)
-	procSelectObject.Call(hdc, oldBrush)
-	procDeleteObject.Call(pen)
-	procDeleteObject.Call(uintptr(brush))
-}
-
 // withFont runs draw with a temporary font selected into hdc.
 func withFont(hdc uintptr, face string, height int32, weight int, draw func()) {
 	font, _, _ := procCreateFont.Call(
@@ -564,17 +550,7 @@ func drawCardShell(hdc uintptr, colors panelColors, look cardLook, top, height i
 	drawGradientRound(hdc, bandRect, style.radius, c1, c2, true)
 
 	text := look.bandText(colors)
-	badgeFill := blendColor(c1, text, 0.28)
-	badge := rect{Left: 24, Top: top + 6, Right: 44, Bottom: top + 26}
-	switch look.id {
-	case providerClaude:
-		drawRoundRect(hdc, badge, 20, badgeFill, badgeFill)
-	case providerAntigravity:
-		drawDiamond(hdc, 34, top+16, 11, badgeFill)
-	default:
-		drawRoundRect(hdc, badge, 12, badgeFill, badgeFill)
-	}
-	drawText(hdc, style.badge, badge, text, dtSingleLine|dtVCenter|dtCenter)
+	drawIcon(hdc, look.id, rect{Left: 24, Top: top + 5, Right: 44, Bottom: top + 25}, text)
 
 	withFont(hdc, style.face, -17, 700, func() {
 		drawText(hdc, providerTitle(look.id), rect{Left: 52, Top: top + 1, Right: 162, Bottom: top + bandHeight}, text, dtSingleLine|dtVCenter)
@@ -723,7 +699,6 @@ var (
 	procSetWindowText    = user32.NewProc("SetWindowTextW")
 	procIsDialogMessage  = user32.NewProc("IsDialogMessageW")
 	procAdjustWindowRect = user32.NewProc("AdjustWindowRectEx")
-	procPolygon          = gdi32.NewProc("Polygon")
 )
 
 type winMessage struct {
