@@ -94,9 +94,11 @@ const (
 	menuRefresh10     = 1010
 	menuRefresh20     = 1011
 	menuRefresh30     = 1012
-	menuRefresh60     = 1013
+	menuRefresh5      = 1013
 	menuCheckUpdates  = 1014
 	menuInstallUpdate = 1015
+	menuRefresh15     = 1016
+	menuProviderBase  = 1020 // one item per entry of providerOrder
 
 	mbOK              = 0x00000000
 	mbYesNo           = 0x00000004
@@ -368,6 +370,9 @@ type appSettings struct {
 	// ServerURL is the CPA base URL (scheme + host, optional path prefix).
 	// Empty means defaultServerURL.
 	ServerURL string `json:",omitempty"`
+	// Providers holds the per-provider switch and dialog values, keyed by the
+	// lowercase provider id. A missing Codex entry means enabled.
+	Providers map[string]providerConfig `json:",omitempty"`
 }
 
 type alertMessage struct {
@@ -378,6 +383,8 @@ type alertMessage struct {
 type appState struct {
 	mu              sync.RWMutex
 	quota           quotaSnapshot
+	codexOK         bool                // the latest Codex sync succeeded
+	ext             map[string]extQuota // Antigravity / Claude, by provider id
 	status          string
 	updated         time.Time
 	settings        appSettings
@@ -419,6 +426,7 @@ type monitorApp struct {
 	trayPressed       bool
 	trayPressHides    bool
 	closing           bool
+	dialog            *providerDialog
 }
 
 var currentApp *monitorApp
@@ -476,7 +484,11 @@ func run() error {
 	if err := registerWindowClass(panelClass, app.instance, callback, syscall.Handle(cursor)); err != nil {
 		return err
 	}
+	if err := registerDialogClass(app.instance, callback, syscall.Handle(cursor)); err != nil {
+		return err
+	}
 
+	initial := app.snapshot()
 	title := utf16Ptr(windowName)
 	hwnd, _, _ := procCreateWindowEx.Call(
 		wsExToolWindow,
@@ -502,7 +514,7 @@ func run() error {
 		uintptr(unsafe.Pointer(panelClass)),
 		uintptr(unsafe.Pointer(title)),
 		wsPopup,
-		0, 0, uintptr(app.scale(panelWidth)), uintptr(app.scale(panelHeightFor(quotaSnapshot{}))),
+		0, 0, uintptr(app.scale(panelWidth)), uintptr(app.scale(panelHeightForState(&initial))),
 		hwnd, 0,
 		uintptr(app.instance),
 		0,
@@ -640,6 +652,17 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		return r
 	}
 	handle := syscall.Handle(hwnd)
+
+	if a.dialog != nil && handle == a.dialog.hwnd {
+		switch message {
+		case wmCommand:
+			a.handleDialogCommand(a.dialog, uint16(wParam))
+			return 0
+		case wmClose:
+			a.handleDialogCommand(a.dialog, idDialogCancel)
+			return 0
+		}
+	}
 
 	if message == a.taskbarMsg && a.taskbarMsg != 0 && handle == a.mainWindow {
 		a.trayAdded = false
@@ -788,7 +811,7 @@ func (a *monitorApp) startFetch(manual bool) {
 	}
 	a.state.mu.Lock()
 	a.state.status = "正在刷新额度…"
-	serverURL := a.state.settings.ServerURL
+	settings := a.state.settings
 	a.state.mu.Unlock()
 	procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
 	go func() {
@@ -799,16 +822,72 @@ func (a *monitorApp) startFetch(manual bool) {
 			default:
 			}
 		}()
-		quota, err := fetchQuota(serverURL)
+		// Every enabled provider is refreshed together, each on its own goroutine.
+		type outcome struct {
+			ran   bool
+			codex quotaSnapshot
+			ext   extQuota
+			err   error
+		}
+		outcomes := make([]outcome, len(providerOrder))
+		var wg sync.WaitGroup
+		for i, id := range providerOrder {
+			if !settings.providerEnabled(id) {
+				continue
+			}
+			outcomes[i].ran = true
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if id == providerCodex {
+					outcomes[i].codex, outcomes[i].err = fetchQuota(settings.ServerURL)
+				} else {
+					outcomes[i].ext, outcomes[i].err = fetchExtQuota(id, settings.providerConfigFor(id))
+				}
+			}()
+		}
+		wg.Wait()
+
 		manual := a.manualRefresh.Swap(false)
-		alert := false
+		var failures, details []string
+		ran := false
 		a.state.mu.Lock()
-		if err != nil {
-			a.state.status = "同步失败：" + shortError(quotaFailureCause(err).Error())
+		if a.state.ext == nil {
+			a.state.ext = map[string]extQuota{}
+		}
+		for i, id := range providerOrder {
+			result := outcomes[i]
+			if !result.ran {
+				continue
+			}
+			ran = true
+			switch {
+			case result.err != nil && id == providerCodex:
+				a.state.codexOK = false
+			case result.err != nil:
+				previous := a.state.ext[id]
+				previous.Failed, previous.Err = true, quotaFailureCause(result.err).Error()
+				a.state.ext[id] = previous
+			case id == providerCodex:
+				a.state.quota, a.state.codexOK = result.codex, true
+			default:
+				a.state.ext[id] = result.ext
+			}
+			if result.err != nil {
+				failures = append(failures, providerTitle(id)+"："+shortError(quotaFailureCause(result.err).Error()))
+				details = append(details, providerTitle(id)+"：\n"+result.err.Error())
+			}
+		}
+		alert := false
+		switch {
+		case !ran:
+			a.state.status = "未启用任何 Provider"
+			a.state.fetchFailing = false
+		case len(failures) > 0:
+			a.state.status = "同步失败：" + strings.Join(failures, "；")
 			alert = manual || !a.state.fetchFailing
 			a.state.fetchFailing = true
-		} else {
-			a.state.quota = quota
+		default:
 			a.state.updated = time.Now()
 			a.state.status = "更新于 " + a.state.updated.Format("15:04:05")
 			a.state.fetchFailing = false
@@ -816,7 +895,7 @@ func (a *monitorApp) startFetch(manual bool) {
 		a.state.mu.Unlock()
 		procPostMessage.Call(uintptr(a.mainWindow), wmStateChanged, 0, 0)
 		if alert {
-			a.queueAlert("额度刷新失败。\n\n"+err.Error(), mbIconWarning)
+			a.queueAlert("额度刷新失败。\n\n"+strings.Join(details, "\n\n"), mbIconWarning)
 		}
 	}()
 }
@@ -861,11 +940,15 @@ func (a *monitorApp) quotaExpiryLoop() {
 		}
 		timer, timerC = nil, nil
 		now := time.Now()
-		quota := a.snapshot().quota
+		state := a.snapshot()
+		quota := state.quota
+		if !state.settings.providerEnabled(providerCodex) {
+			quota = quotaSnapshot{}
+		}
 		for _, notice := range recoveries.update(quota.Nominal, now) {
 			a.queueNotice(notice)
 		}
-		next, expired := nextQuotaExpiry(quota, now, handledThrough)
+		next, expired := nextQuotaExpiry(quota, now, handledThrough, extResetTimes(&state)...)
 		if due := recoveries.nextDue(); !due.IsZero() && (next.IsZero() || due.Before(next)) {
 			next = due
 		}
@@ -886,7 +969,9 @@ func (a *monitorApp) scheduleTrayRetry() {
 }
 
 func (a *monitorApp) addTrayIcon() error {
-	icon := createTrayIcon(trayAccount(a.snapshot().quota), a.iconSize)
+	current := a.snapshot()
+	_, trayData := trayTarget(&current)
+	icon := createTrayIcon(trayData, a.iconSize)
 	if icon == 0 {
 		return winError("CreateIconIndirect")
 	}
@@ -1035,10 +1120,13 @@ func (a *monitorApp) dialogOwner() syscall.Handle {
 
 func (a *monitorApp) tooltip() string {
 	s := a.snapshot()
-	account := trayAccount(s.quota)
+	title, account := trayTarget(&s)
 	name := account.Email
 	if name == "" {
 		name = "实际账户"
+	}
+	if title != providerTitle(providerCodex) {
+		name = title + " · " + name
 	}
 	result := fmt.Sprintf("%s\n5小时剩余：%s  周额度剩余：%s", name, bucketText(account.Primary), bucketText(account.Secondary))
 	if strings.HasPrefix(s.status, "同步失败") {
@@ -1067,8 +1155,14 @@ func trayAccount(quota quotaSnapshot) accountQuota {
 func (a *monitorApp) snapshot() appState {
 	a.state.mu.RLock()
 	defer a.state.mu.RUnlock()
+	ext := make(map[string]extQuota, len(a.state.ext))
+	for id, q := range a.state.ext {
+		ext[id] = q
+	}
 	return appState{
 		quota:           a.state.quota,
+		codexOK:         a.state.codexOK,
+		ext:             ext,
 		status:          a.state.status,
 		updated:         a.state.updated,
 		settings:        a.state.settings,
@@ -1086,8 +1180,8 @@ func (a *monitorApp) trayClickHidesPanel() bool {
 	return a.panelVisible || time.Since(a.panelAutoHiddenAt) < trayToggleGrace
 }
 
-func (a *monitorApp) panelSize(quota quotaSnapshot) (int32, int32) {
-	return a.scale(panelWidth), a.scale(panelHeightFor(quota))
+func (a *monitorApp) panelSize(s *appState) (int32, int32) {
+	return a.scale(panelWidth), a.scale(panelHeightForState(s))
 }
 
 func (a *monitorApp) showPanel() {
@@ -1096,7 +1190,7 @@ func (a *monitorApp) showPanel() {
 	}
 	snapshot := a.snapshot()
 	settings := snapshot.settings
-	width, height := a.panelSize(snapshot.quota)
+	width, height := a.panelSize(&snapshot)
 	var x, y int32
 	if settings.PositionSet {
 		x, y = clampPanelPosition(settings.PanelX, settings.PanelY, width, height)
@@ -1126,7 +1220,8 @@ func (a *monitorApp) resizePanel() {
 	if r, _, _ := procGetWindowRect.Call(uintptr(a.panelWindow), uintptr(unsafe.Pointer(&bounds))); r == 0 {
 		return
 	}
-	width, height := a.panelSize(a.snapshot().quota)
+	current := a.snapshot()
+	width, height := a.panelSize(&current)
 	x, y := clampPanelPosition(bounds.Left, bounds.Top, width, height)
 	procSetWindowPos.Call(uintptr(a.panelWindow), 0, uintptr(x), uintptr(y), uintptr(width), uintptr(height), swpNoActivate|swpNoZOrder)
 }
@@ -1229,18 +1324,19 @@ func (a *monitorApp) showMenu() {
 		appendMenu(menu, flags, menuInstallUpdate, label)
 	}
 	appendMenu(menu, 0x00000800, 0, "")
+	for i, id := range providerOrder {
+		appendMenu(menu, 0, uintptr(menuProviderBase+i), providerTitle(id))
+		checkMenu(menu, uint16(menuProviderBase+i), snapshot.settings.providerEnabled(id))
+	}
+	appendMenu(menu, 0x00000800, 0, "")
 	intervalMenu, _, _ := procCreatePopupMenu.Call()
 	if intervalMenu != 0 {
-		appendMenu(intervalMenu, 0, menuRefresh10, "10分钟")
-		appendMenu(intervalMenu, 0, menuRefresh20, "20分钟")
-		appendMenu(intervalMenu, 0, menuRefresh30, "30分钟")
-		appendMenu(intervalMenu, 0, menuRefresh60, "1小时")
-		appendMenu(menu, 0x00000010, intervalMenu, "刷新间隔")
 		minutes := snapshot.settings.RefreshMinutes
-		checkMenu(intervalMenu, menuRefresh10, minutes == 10)
-		checkMenu(intervalMenu, menuRefresh20, minutes == 20)
-		checkMenu(intervalMenu, menuRefresh30, minutes == 30)
-		checkMenu(intervalMenu, menuRefresh60, minutes == 60)
+		for _, option := range refreshIntervalOptions {
+			appendMenu(intervalMenu, 0, uintptr(option.menuID), refreshIntervalLabel(option.minutes))
+			checkMenu(intervalMenu, option.menuID, minutes == option.minutes)
+		}
+		appendMenu(menu, 0x00000010, intervalMenu, "刷新间隔")
 	}
 	appendMenu(menu, 0x00000800, 0, "")
 	appendMenu(menu, 0, menuOpenPanel, "窗口打开")
@@ -1265,7 +1361,7 @@ func (a *monitorApp) showMenu() {
 		a.handleMenuCommand(uint16(selected))
 	}
 	a.menuOpen = false
-	if uint16(selected) != menuOpenPanel && !a.snapshot().settings.AlwaysOnTop && a.panelVisible {
+	if uint16(selected) != menuOpenPanel && !isProviderCommand(uint16(selected)) && !a.snapshot().settings.AlwaysOnTop && a.panelVisible {
 		a.hidePanel()
 	}
 }
@@ -1302,10 +1398,12 @@ func (a *monitorApp) handlePanelButton(button string) {
 // panelButtonAt hit-tests a point in panel layout units.
 func (a *monitorApp) panelButtonAt(pt point) string {
 	s := a.snapshot()
-	cards, _ := panelLayout(s.quota)
-	for _, card := range cards {
-		if card.resetButton && containsPoint(panelResetButtonRect(card.top, card.height), pt) {
-			return "reset"
+	sections, _ := sectionLayout(&s)
+	for _, section := range sections {
+		for _, card := range section.cards {
+			if card.resetButton && containsPoint(panelResetButtonRect(card.top, card.height), pt) {
+				return "reset"
+			}
 		}
 	}
 	switch {
@@ -1325,7 +1423,7 @@ func (a *monitorApp) panelButtonAt(pt point) string {
 }
 
 func panelResetButtonRect(top, height int32) rect {
-	sectionTop := top + 84
+	sectionTop := top + 95
 	sectionBottom := top + height - 10
 	buttonTop := (sectionTop+sectionBottom)/2 - 17
 	return rect{Left: panelWidth - 58, Top: buttonTop, Right: panelWidth - 24, Bottom: buttonTop + 34}
@@ -1379,14 +1477,12 @@ func (a *monitorApp) handleMenuCommand(command uint16) {
 		a.checkForUpdate(true)
 	case menuInstallUpdate:
 		a.installUpdate()
-	case menuRefresh10:
-		a.setRefreshInterval(10)
-	case menuRefresh20:
-		a.setRefreshInterval(20)
-	case menuRefresh30:
-		a.setRefreshInterval(30)
-	case menuRefresh60:
-		a.setRefreshInterval(60)
+	case menuRefresh5, menuRefresh10, menuRefresh15, menuRefresh20, menuRefresh30:
+		for _, option := range refreshIntervalOptions {
+			if option.menuID == command {
+				a.setRefreshInterval(option.minutes)
+			}
+		}
 	case menuOpenPanel:
 		a.showPanel()
 	case menuTopmost:
@@ -1408,8 +1504,22 @@ func (a *monitorApp) handleMenuCommand(command uint16) {
 		}
 	case menuExit:
 		a.shutdown()
+	default:
+		if isProviderCommand(command) {
+			a.editProvider(providerOrder[command-menuProviderBase])
+		}
 	}
 }
+
+func isProviderCommand(command uint16) bool {
+	return command >= menuProviderBase && int(command) < menuProviderBase+len(providerOrder)
+}
+
+// refreshIntervalOptions lists the selectable auto-refresh periods.
+var refreshIntervalOptions = []struct {
+	minutes int
+	menuID  uint16
+}{{5, menuRefresh5}, {10, menuRefresh10}, {15, menuRefresh15}, {20, menuRefresh20}, {30, menuRefresh30}}
 
 func (a *monitorApp) toggleAlwaysOnTop() {
 	a.state.mu.Lock()
@@ -1556,7 +1666,7 @@ const (
 	panelHeaderHeight = 46
 	panelCardGap      = 10
 	panelBottomMargin = 14
-	actualCardHeight  = 94
+	actualCardHeight  = 100
 )
 
 type panelCard struct {
@@ -1570,12 +1680,18 @@ type panelCard struct {
 // panelLayout stacks one card per nominal account, then one per actual
 // account. Before the first successful sync an empty nominal card is shown.
 func panelLayout(quota quotaSnapshot) ([]panelCard, int32) {
+	cards, end := codexCards(quota, panelHeaderHeight)
+	return cards, end - panelCardGap + panelBottomMargin
+}
+
+// codexCards lays the Codex cards out from top and returns the y just below
+// the last card's trailing gap.
+func codexCards(quota quotaSnapshot, top int32) ([]panelCard, int32) {
 	nominal := quota.Nominal
 	if len(nominal) == 0 {
 		nominal = []accountQuota{{}}
 	}
 	cards := make([]panelCard, 0, len(nominal)+len(quota.Actual))
-	top := int32(panelHeaderHeight)
 	for i, account := range nominal {
 		height := nominalCardHeight(account)
 		cards = append(cards, panelCard{account: account, nominal: true, top: top, height: height, resetButton: i == 0 && quota.ResetSupported})
@@ -1585,7 +1701,7 @@ func panelLayout(quota quotaSnapshot) ([]panelCard, int32) {
 		cards = append(cards, panelCard{account: account, top: top, height: actualCardHeight})
 		top += actualCardHeight + panelCardGap
 	}
-	return cards, top - panelCardGap + panelBottomMargin
+	return cards, top
 }
 
 type panelColors struct {
@@ -1597,6 +1713,9 @@ type panelColors struct {
 	track      uint32
 	button     uint32
 	buttonText uint32
+	warn       uint32
+	danger     uint32
+	dark       bool
 }
 
 func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
@@ -1607,8 +1726,13 @@ func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
 	}
 	defer procEndPaint.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&ps)))
 	s := a.snapshot()
+	a.drawPanel(hdc, &s)
+}
+
+// drawPanel renders the whole panel for state s into hdc.
+func (a *monitorApp) drawPanel(hdc uintptr, s *appState) {
 	colors := colorsForTheme(s.settings.ThemeMode)
-	cards, height := panelLayout(s.quota)
+	sections, height := sectionLayout(s)
 
 	// Draw in 96-DPI layout units and let GDI scale coordinates, pens and font
 	// sizes to the real DPI, so text is rasterized at full resolution.
@@ -1639,7 +1763,7 @@ func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
 	case themeDark:
 		themeLabel = "暗色"
 	}
-	drawText(hdc, "Codex 额度监控", rect{Left: 18, Top: 6, Right: 190, Bottom: 36}, colors.text, dtSingleLine|dtVCenter)
+	drawText(hdc, "额度监控", rect{Left: 18, Top: 6, Right: 190, Bottom: 36}, colors.text, dtSingleLine|dtVCenter)
 	if s.updateAvailable && !strings.HasPrefix(s.updateStatus, "更新失败") {
 		label := "更新到 " + s.updateRelease.Tag
 		if a.installingUpdate.Load() {
@@ -1658,11 +1782,24 @@ func (a *monitorApp) paintPanel(hwnd syscall.Handle) {
 	drawPanelButton(hdc, panelMinimizeButtonRect(), "—", colors)
 	drawPanelButton(hdc, panelExitButtonRect(), "×", colors)
 
-	for _, card := range cards {
-		if card.nominal {
-			drawNominalAccountCard(hdc, colors, card, s.quota.DirectMode, s.quota.singleAccount())
-		} else {
-			drawActualAccountCard(hdc, colors, card.top, card.account)
+	if len(sections) == 0 {
+		drawText(hdc, "尚未启用任何 Provider。右键托盘图标，勾选 Codex / Antigravity / Claude。",
+			rect{Left: 18, Top: panelHeaderHeight, Right: panelWidth - 18, Bottom: panelHeaderHeight + emptyPanelHintHeight},
+			colors.muted, dtSingleLine|dtVCenter|dtEndEllipsis)
+		return
+	}
+	for _, section := range sections {
+		if section.provider != providerCodex {
+			drawExtCard(hdc, colors, section)
+			continue
+		}
+		look := cardLook{style: styleFor(providerCodex, colors.dark), connected: section.connected, id: providerCodex}
+		for _, card := range section.cards {
+			if card.nominal {
+				drawNominalAccountCard(hdc, colors, look, card)
+			} else {
+				drawActualAccountCard(hdc, colors, look, card.top, card.account)
+			}
 		}
 	}
 }
@@ -1695,42 +1832,32 @@ func drawPinButton(hdc uintptr, bounds rect, colors panelColors, enabled bool) {
 	drawText(hdc, "📌", bounds, iconColor, dtSingleLine|dtVCenter|dtCenter)
 }
 
-func drawNominalAccountCard(hdc uintptr, colors panelColors, card panelCard, directMode, singleAccount bool) {
+// codexCardDetail is the band text, laid out like the other providers' "email · plan".
+func codexCardDetail(account accountQuota) string {
+	return accountEmail(account) + "  ·  Plus"
+}
+
+func drawNominalAccountCard(hdc uintptr, colors panelColors, look cardLook, card panelCard) {
 	top, account := card.top, card.account
-	drawCardBackground(hdc, colors, top, card.height)
-	accountTitle := nominalAccountTitle(directMode, singleAccount)
-	drawText(hdc, accountTitle+"  ·  "+accountEmail(account),
-		rect{Left: 27, Top: top + 5, Right: panelWidth - 25, Bottom: top + 29}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
-	drawMeter(hdc, "5小时", 27, top+38, account.Primary, colors)
-	drawMeter(hdc, "周额度", 27, top+62, account.Secondary, colors)
-	drawHorizontalDivider(hdc, 27, panelWidth-27, top+83, colors.border)
+	drawCardShell(hdc, colors, look, top, card.height, codexCardDetail(account))
+	drawStyledMeter(hdc, "5小时", 27, top+bandHeight+14, account.Primary, colors, look)
+	drawStyledMeter(hdc, "周额度", 27, top+bandHeight+14+extRowPitch, account.Secondary, colors, look)
+	drawHorizontalDivider(hdc, 27, panelWidth-27, top+94, colors.border)
 	drawText(hdc, fmt.Sprintf("重置次数  ·  %d 次", account.Reset.AvailableCount),
-		rect{Left: 27, Top: top + 86, Right: panelWidth - 74, Bottom: top + 109}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
+		rect{Left: 27, Top: top + 97, Right: panelWidth - 74, Bottom: top + 120}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
 	if card.resetButton {
 		drawPanelButton(hdc, panelResetButtonRect(top, card.height), "↻", colors)
 	}
 	for i, line := range resetCreditLines(account.Reset, time.Now()) {
-		rowTop := top + 112 + int32(i)*20
+		rowTop := top + 123 + int32(i)*20
 		drawText(hdc, line, rect{Left: 27, Top: rowTop, Right: panelWidth - 72, Bottom: rowTop + 19}, colors.muted, dtSingleLine|dtVCenter|dtEndEllipsis)
 	}
 }
 
-func nominalAccountTitle(directMode, singleAccount bool) string {
-	if singleAccount {
-		return "账户"
-	}
-	if directMode {
-		return "ChatGPT 账户"
-	}
-	return "名义账户"
-}
-
-func drawActualAccountCard(hdc uintptr, colors panelColors, top int32, account accountQuota) {
-	drawCardBackground(hdc, colors, top, actualCardHeight)
-	drawText(hdc, "实际账户  ·  "+accountEmail(account),
-		rect{Left: 27, Top: top + 5, Right: panelWidth - 25, Bottom: top + 27}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
-	drawMeter(hdc, "5小时", 27, top+39, account.Primary, colors)
-	drawMeter(hdc, "周额度", 27, top+63, account.Secondary, colors)
+func drawActualAccountCard(hdc uintptr, colors panelColors, look cardLook, top int32, account accountQuota) {
+	drawCardShell(hdc, colors, look, top, actualCardHeight, codexCardDetail(account))
+	drawStyledMeter(hdc, "5小时", 27, top+bandHeight+14, account.Primary, colors, look)
+	drawStyledMeter(hdc, "周额度", 27, top+bandHeight+14+extRowPitch, account.Secondary, colors, look)
 }
 
 func accountEmail(account accountQuota) string {
@@ -1740,10 +1867,6 @@ func accountEmail(account accountQuota) string {
 	return account.Email
 }
 
-func drawCardBackground(hdc uintptr, colors panelColors, top, height int32) {
-	drawRoundRect(hdc, rect{Left: 14, Top: top, Right: panelWidth - 14, Bottom: top + height}, 9, colors.card, colors.border)
-}
-
 func drawHorizontalDivider(hdc uintptr, left, right, y int32, color uint32) {
 	pen, _, _ := procCreatePen.Call(0, 1, uintptr(color))
 	oldPen, _, _ := procSelectObject.Call(hdc, pen)
@@ -1751,23 +1874,6 @@ func drawHorizontalDivider(hdc uintptr, left, right, y int32, color uint32) {
 	procLineTo.Call(hdc, uintptr(right), uintptr(y))
 	procSelectObject.Call(hdc, oldPen)
 	procDeleteObject.Call(pen)
-}
-
-func drawMeter(hdc uintptr, label string, left, top int32, bucket quotaBucket, colors panelColors) {
-	drawText(hdc, label, rect{Left: left, Top: top - 4, Right: left + 54, Bottom: top + 16}, colors.muted, dtSingleLine|dtVCenter)
-	barLeft, barRight := left+64, left+235
-	drawRoundRect(hdc, rect{Left: barLeft, Top: top, Right: barRight, Bottom: top + 12}, 6, colors.track, colors.track)
-	if bucket.Known && bucket.Percent > 0 {
-		width := max(int32(float64(barRight-barLeft)*float64(bucket.Percent)/100.0), 4)
-		fill := quotaColor(bucket.Percent)
-		drawRoundRect(hdc, rect{Left: barLeft, Top: top, Right: barLeft + width, Bottom: top + 12}, 6, fill, fill)
-	}
-	drawText(hdc, bucketText(bucket),
-		rect{Left: barRight + 8, Top: top - 4, Right: barRight + 64, Bottom: top + 16},
-		colors.text, dtSingleLine|dtVCenter)
-	drawText(hdc, quotaRemainingText(bucket, time.Now()),
-		rect{Left: barRight + 72, Top: top - 4, Right: panelWidth - 24, Bottom: top + 16},
-		colors.muted, dtSingleLine|dtVCenter|dtEndEllipsis)
 }
 
 func quotaColor(percent int) uint32 {
@@ -1836,25 +1942,30 @@ func colorsForTheme(mode string) panelColors {
 		(normalizedThemeMode(mode) == themeSystem && !systemPrefersLightTheme())
 	if dark {
 		return panelColors{
-			background: colorRef(19, 24, 34),
-			card:       colorRef(29, 37, 50),
-			border:     colorRef(49, 62, 79),
-			text:       colorRef(235, 241, 248),
-			muted:      colorRef(155, 168, 184),
-			track:      colorRef(54, 65, 81),
-			button:     colorRef(36, 45, 60),
-			buttonText: colorRef(220, 229, 239),
+			background: colorRef(23, 24, 28),
+			card:       colorRef(32, 34, 42),
+			border:     colorRef(46, 49, 58),
+			text:       colorRef(236, 237, 241),
+			muted:      colorRef(154, 160, 173),
+			track:      colorRef(54, 57, 68),
+			button:     colorRef(40, 43, 52),
+			buttonText: colorRef(220, 222, 230),
+			warn:       colorRef(242, 192, 55),
+			danger:     colorRef(229, 72, 77),
+			dark:       true,
 		}
 	}
 	return panelColors{
-		background: colorRef(243, 246, 250),
+		background: colorRef(246, 245, 242),
 		card:       colorRef(255, 255, 255),
-		border:     colorRef(216, 223, 232),
-		text:       colorRef(35, 45, 58),
-		muted:      colorRef(104, 116, 132),
-		track:      colorRef(226, 231, 238),
-		button:     colorRef(235, 240, 246),
-		buttonText: colorRef(53, 66, 83),
+		border:     colorRef(227, 225, 218),
+		text:       colorRef(31, 32, 36),
+		muted:      colorRef(107, 111, 122),
+		track:      colorRef(230, 228, 222),
+		button:     colorRef(236, 234, 228),
+		buttonText: colorRef(60, 62, 70),
+		warn:       colorRef(214, 150, 0),
+		danger:     colorRef(229, 72, 77),
 	}
 }
 
@@ -1879,7 +1990,7 @@ func systemPrefersLightTheme() bool {
 
 func nominalCardHeight(account accountQuota) int32 {
 	rows := len(resetCreditLines(account.Reset, time.Now()))
-	return int32(122 + rows*20)
+	return int32(133 + rows*20)
 }
 
 func panelHeightFor(quota quotaSnapshot) int32 {
@@ -2657,7 +2768,9 @@ func (t *quotaRecoveryTracker) nextDue() time.Time {
 	return next
 }
 
-func nextQuotaExpiry(quota quotaSnapshot, now, handledThrough time.Time) (time.Time, bool) {
+// nextQuotaExpiry finds the earliest upcoming reset or credit expiry across the
+// Codex snapshot and any extra reset times (Antigravity / Claude windows).
+func nextQuotaExpiry(quota quotaSnapshot, now, handledThrough time.Time, extra ...time.Time) (time.Time, bool) {
 	var next time.Time
 	expired := false
 	consider := func(at time.Time) {
@@ -2680,6 +2793,9 @@ func nextQuotaExpiry(quota quotaSnapshot, now, handledThrough time.Time) (time.T
 				consider(parseQuotaResetTime(raw))
 			}
 		}
+	}
+	for _, at := range extra {
+		consider(at)
 	}
 	return next, expired
 }
@@ -2717,13 +2833,10 @@ func loadSettings() appSettings {
 }
 
 func validRefreshInterval(minutes int) bool {
-	return minutes == 10 || minutes == 20 || minutes == 30 || minutes == 60
+	return minutes == 5 || minutes == 10 || minutes == 15 || minutes == 20 || minutes == 30
 }
 
 func refreshIntervalLabel(minutes int) string {
-	if minutes == 60 {
-		return "1小时"
-	}
 	return fmt.Sprintf("%d分钟", minutes)
 }
 

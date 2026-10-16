@@ -24,7 +24,8 @@ import (
 )
 
 const (
-	latestReleaseURL      = "https://api.github.com/repos/taoxian000/CPA-Quota-Query/releases/latest"
+	githubProxyPrefix     = "https://gh-proxy.com/"
+	latestReleaseURL      = githubProxyPrefix + "https://api.github.com/repos/taoxian000/CPA-Quota-Query/releases/latest"
 	legacyUpdateAssetName = "quota-monitor-windows-amd64.exe"
 	maxUpdateBytes        = 64 << 20
 	updateCheckEvery      = 24 * time.Hour
@@ -32,7 +33,7 @@ const (
 
 var (
 	// appVersion is overridden at build time with -X main.appVersion=<tag>.
-	appVersion       = "v1.5"
+	appVersion       = "v1.6"
 	procShellExecute = shell32.NewProc("ShellExecuteW")
 	errNoRelease     = errors.New("尚无正式 Release")
 )
@@ -201,7 +202,7 @@ func selectReleaseAsset(release githubRelease) (updateRelease, error) {
 	if err != nil {
 		return updateRelease{}, err
 	}
-	return updateRelease{Tag: release.TagName, URL: parsedURL.String(), Digest: digest, Size: asset.Size}, nil
+	return updateRelease{Tag: release.TagName, URL: githubProxyPrefix + parsedURL.String(), Digest: digest, Size: asset.Size}, nil
 }
 
 func versionedUpdateAssetName(tag string) string {

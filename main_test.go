@@ -503,18 +503,6 @@ func TestResetConfirmationDescribesEveryNominalAccount(t *testing.T) {
 	}
 }
 
-func TestNominalAccountTitleForSingleAccount(t *testing.T) {
-	if got := nominalAccountTitle(false, true); got != "账户" {
-		t.Fatalf("single-account title = %q, want 账户", got)
-	}
-	if got := nominalAccountTitle(false, false); got != "名义账户" {
-		t.Fatalf("multi-account nominal title = %q, want 名义账户", got)
-	}
-	if got := nominalAccountTitle(true, false); got != "ChatGPT 账户" {
-		t.Fatalf("non-single direct title = %q, want ChatGPT 账户", got)
-	}
-}
-
 func TestParseQuotaEnvelopeMarksSingleAccount(t *testing.T) {
 	var single responseEnvelope
 	if err := json.Unmarshal([]byte(`{"nominal_accounts":{"single@example.test":{"groups":[]}}}`), &single); err != nil {
