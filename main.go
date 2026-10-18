@@ -56,6 +56,8 @@ const (
 	wmTimer            = 0x0113
 	wmLButtonDown      = 0x0201
 	wmExitSizeMove     = 0x0232
+	wmMoving           = 0x0216
+	vkMenu             = 0x12 // Alt
 	wmNCLButtonDown    = 0x00A1
 	wmNull             = 0x0000
 	wmLButtonUp        = 0x0202
@@ -177,6 +179,7 @@ var (
 	procSetWindowPos           = user32.NewProc("SetWindowPos")
 	procSendMessage            = user32.NewProc("SendMessageW")
 	procReleaseCapture         = user32.NewProc("ReleaseCapture")
+	procGetAsyncKeyState       = user32.NewProc("GetAsyncKeyState")
 	procGetWindowRect          = user32.NewProc("GetWindowRect")
 	procSetForegroundWindow    = user32.NewProc("SetForegroundWindow")
 	procGetCursorPos           = user32.NewProc("GetCursorPos")
@@ -766,6 +769,11 @@ func windowProc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintptr {
 		case wmRButtonUp, wmContextMenu:
 			a.showMenu()
 			return 0
+		case wmMoving:
+			if lParam != 0 {
+				a.snapMovingPanel(*(**rect)(unsafe.Pointer(&lParam)))
+			}
+			return 1
 		case wmExitSizeMove:
 			a.savePanelPosition()
 			return 0
@@ -1222,7 +1230,11 @@ func (a *monitorApp) resizePanel() {
 	}
 	current := a.snapshot()
 	width, height := a.panelSize(&current)
-	x, y := clampPanelPosition(bounds.Left, bounds.Top, width, height)
+	x, y := bounds.Left, bounds.Top
+	if work, ok := panelWorkArea(bounds); ok {
+		x, y = keepSnappedEdges(bounds, width, height, work)
+	}
+	x, y = clampPanelPosition(x, y, width, height)
 	procSetWindowPos.Call(uintptr(a.panelWindow), 0, uintptr(x), uintptr(y), uintptr(width), uintptr(height), swpNoActivate|swpNoZOrder)
 }
 
@@ -1277,13 +1289,75 @@ func panelPosition(anchor point, width, height, gap int32) (int32, int32) {
 }
 
 func clampPanelPosition(x, y, width, height int32) (int32, int32) {
-	center := point{X: x + width/2, Y: y + height/2}
+	work, ok := panelWorkArea(rect{Left: x, Top: y, Right: x + width, Bottom: y + height})
+	if !ok {
+		return x, y
+	}
+	return clampToWorkArea(x, y, width, height, work)
+}
+
+// panelWorkArea is the work area (screen minus taskbar) of the monitor that
+// holds the centre of bounds.
+func panelWorkArea(bounds rect) (rect, bool) {
+	center := point{X: (bounds.Left + bounds.Right) / 2, Y: (bounds.Top + bounds.Bottom) / 2}
 	monitor, _, _ := procMonitorFromPoint.Call(*(*uintptr)(unsafe.Pointer(&center)), monDefaultToNearest)
 	mi := monitorInfo{Size: uint32(unsafe.Sizeof(monitorInfo{}))}
 	if r, _, _ := procGetMonitorInfo.Call(monitor, uintptr(unsafe.Pointer(&mi))); r == 0 {
-		return x, y
+		return rect{}, false
 	}
-	return clampToWorkArea(x, y, width, height, mi.Work)
+	return mi.Work, true
+}
+
+// panelSnapDistance is how close (in 96-DPI units) a dragged panel edge must
+// come to the work-area edge to be pulled onto it.
+const panelSnapDistance = 16
+
+// snapDelta returns how far to shift the span [lo, hi) so that an end lands on
+// the matching end of [workLo, workHi), or 0 when neither end is within
+// distance. The nearer end wins.
+func snapDelta(lo, hi, workLo, workHi, distance int32) int32 {
+	toLo, toHi := workLo-lo, workHi-hi
+	abs := func(v int32) int32 { return max(v, -v) }
+	switch {
+	case abs(toLo) <= distance && abs(toLo) <= abs(toHi):
+		return toLo
+	case abs(toHi) <= distance:
+		return toHi
+	}
+	return 0
+}
+
+// snapToWorkArea pulls bounds onto the work-area edges (and so the corners)
+// it is within distance of, each axis independently.
+func snapToWorkArea(bounds, work rect, distance int32) rect {
+	dx := snapDelta(bounds.Left, bounds.Right, work.Left, work.Right, distance)
+	dy := snapDelta(bounds.Top, bounds.Bottom, work.Top, work.Bottom, distance)
+	return rect{Left: bounds.Left + dx, Top: bounds.Top + dy, Right: bounds.Right + dx, Bottom: bounds.Bottom + dy}
+}
+
+// snapMovingPanel adjusts the rectangle Windows is about to move the panel to.
+// Holding Alt drags freely.
+func (a *monitorApp) snapMovingPanel(bounds *rect) {
+	if state, _, _ := procGetAsyncKeyState.Call(vkMenu); state&0x8000 != 0 {
+		return
+	}
+	if work, ok := panelWorkArea(*bounds); ok {
+		*bounds = snapToWorkArea(*bounds, work, a.scale(panelSnapDistance))
+	}
+}
+
+// keepSnappedEdges keeps a panel that sits flush against the right or bottom
+// work-area edge on that edge when its size changes, instead of letting the
+// growing or shrinking panel drift away from it.
+func keepSnappedEdges(old rect, width, height int32, work rect) (int32, int32) {
+	x, y := old.Left, old.Top
+	if old.Right == work.Right {
+		x = work.Right - width
+	}
+	if old.Bottom == work.Bottom {
+		y = work.Bottom - height
+	}
+	return x, y
 }
 
 // clampToWorkArea keeps the panel inside the work area. If the panel is taller

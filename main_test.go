@@ -25,6 +25,11 @@ func TestCompareVersions(t *testing.T) {
 		{left: "v1.1", right: "v1.1.0", want: 0},
 		{left: "v1.10", right: "v1.9", want: 1},
 		{left: "v2.0.0", right: "v2.1", want: -1},
+		{left: "v1.7a", right: "v1.7", want: 1},
+		{left: "v1.7a", right: "v1.8", want: -1},
+		{left: "v1.7b", right: "v1.7a", want: 1},
+		{left: "v1.7a", right: "v1.7.0a", want: 0},
+		{left: "v1.7aa", right: "v1.7", wantErr: true},
 		{left: "v1.1-beta", right: "v1.1", wantErr: true},
 		{left: "1.1", right: "v1.1", wantErr: true},
 		{left: "v01.1", right: "v1.1", wantErr: true},
@@ -700,6 +705,44 @@ func TestScaleForDPI(t *testing.T) {
 	app := &monitorApp{dpi: 144}
 	if got := app.logicalPoint(point{X: 810, Y: 150}); got != (point{X: 540, Y: 100}) {
 		t.Fatalf("logicalPoint() = %+v, want {540 100}", got)
+	}
+}
+
+func TestSnapToWorkArea(t *testing.T) {
+	work := rect{Left: 100, Top: 0, Right: 2020, Bottom: 1040}
+	tests := []struct {
+		name   string
+		bounds rect
+		want   rect
+	}{
+		{"top-left corner", rect{Left: 108, Top: 9, Right: 648, Bottom: 309}, rect{Left: 100, Top: 0, Right: 640, Bottom: 300}},
+		{"bottom-right corner", rect{Left: 1490, Top: 750, Right: 2030, Bottom: 1050}, rect{Left: 1480, Top: 740, Right: 2020, Bottom: 1040}},
+		{"left edge only", rect{Left: 95, Top: 400, Right: 635, Bottom: 700}, rect{Left: 100, Top: 400, Right: 640, Bottom: 700}},
+		{"bottom edge only", rect{Left: 600, Top: 745, Right: 1140, Bottom: 1045}, rect{Left: 600, Top: 740, Right: 1140, Bottom: 1040}},
+		{"outside the snap distance", rect{Left: 130, Top: 400, Right: 670, Bottom: 700}, rect{Left: 130, Top: 400, Right: 670, Bottom: 700}},
+		{"already flush", rect{Left: 100, Top: 0, Right: 640, Bottom: 300}, rect{Left: 100, Top: 0, Right: 640, Bottom: 300}},
+	}
+	for _, tt := range tests {
+		if got := snapToWorkArea(tt.bounds, work, 16); got != tt.want {
+			t.Errorf("%s: snapToWorkArea() = %+v, want %+v", tt.name, got, tt.want)
+		}
+	}
+	// A panel as tall as the work area is within reach of both edges; the nearer wins.
+	tall := rect{Left: 600, Top: 4, Right: 1140, Bottom: 1042}
+	if got := snapToWorkArea(tall, work, 16); got.Top != 2 || got.Bottom != 1040 {
+		t.Errorf("tall panel = %+v, want the nearer bottom edge snapped to 1040", got)
+	}
+}
+
+func TestKeepSnappedEdges(t *testing.T) {
+	work := rect{Left: 0, Top: 0, Right: 1920, Bottom: 1040}
+	// Flush bottom-right: a taller, wider panel grows up and to the left.
+	if x, y := keepSnappedEdges(rect{Left: 1380, Top: 740, Right: 1920, Bottom: 1040}, 600, 400, work); x != 1320 || y != 640 {
+		t.Fatalf("flush bottom-right resize = (%d, %d), want (1320, 640)", x, y)
+	}
+	// Not flush: the top-left corner stays where it is.
+	if x, y := keepSnappedEdges(rect{Left: 500, Top: 300, Right: 1040, Bottom: 600}, 540, 400, work); x != 500 || y != 300 {
+		t.Fatalf("free resize = (%d, %d), want (500, 300)", x, y)
 	}
 }
 

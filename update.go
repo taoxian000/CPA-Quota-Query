@@ -33,7 +33,7 @@ const (
 
 var (
 	// appVersion is overridden at build time with -X main.appVersion=<tag>.
-	appVersion       = "v1.7"
+	appVersion       = "v1.7a"
 	procShellExecute = shell32.NewProc("ShellExecuteW")
 	errNoRelease     = errors.New("尚无正式 Release")
 )
@@ -280,12 +280,20 @@ func downloadAndVerify(client *http.Client, release updateRelease) (string, erro
 	return path, nil
 }
 
-func parseVersion(value string) ([3]uint64, error) {
-	var result [3]uint64
+// parseVersion reads vMAJOR.MINOR[.PATCH] with an optional single lowercase
+// letter after the last number (v1.7a, a hotfix of v1.7). The letter is the
+// fourth component, so v1.7 < v1.7a < v1.8.
+func parseVersion(value string) ([4]uint64, error) {
+	var result [4]uint64
 	if !strings.HasPrefix(value, "v") {
 		return result, fmt.Errorf("版本号必须以 v 开头：%q", value)
 	}
-	parts := strings.Split(strings.TrimPrefix(value, "v"), ".")
+	body := strings.TrimPrefix(value, "v")
+	if n := len(body); n > 0 && body[n-1] >= 'a' && body[n-1] <= 'z' {
+		result[3] = uint64(body[n-1]-'a') + 1
+		body = body[:n-1]
+	}
+	parts := strings.Split(body, ".")
 	if len(parts) != 2 && len(parts) != 3 {
 		return result, fmt.Errorf("版本号格式无效：%q", value)
 	}
