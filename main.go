@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -929,18 +930,21 @@ func (a *monitorApp) refreshLoop() {
 	}
 }
 
-// quotaExpiryLoop forces a refresh whenever a quota window or reset credit
-// expires, and announces nominal-account windows that recover from 0%.
+// quotaExpiryLoop forces a refresh a random 0–30 s after a quota window or
+// reset credit expires, and announces nominal-account windows that recover from
+// 0% at that same moment.
 func (a *monitorApp) quotaExpiryLoop() {
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	var handledThrough time.Time
 	recoveries := newQuotaRecoveryTracker()
+	jitter := newRefreshJitter()
 	for {
 		select {
 		case <-a.quotaChanged:
 		case <-timerC:
 			handledThrough = time.Now()
+			jitter.forget(handledThrough)
 			a.startFetch(false)
 		}
 		if timer != nil {
@@ -956,9 +960,12 @@ func (a *monitorApp) quotaExpiryLoop() {
 		for _, notice := range recoveries.update(quota.Nominal, now) {
 			a.queueNotice(notice)
 		}
-		next, expired := nextQuotaExpiry(quota, now, handledThrough, extResetTimes(&state)...)
-		if due := recoveries.nextDue(); !due.IsZero() && (next.IsZero() || due.Before(next)) {
-			next = due
+		next, expired := nextQuotaExpiry(quota, now, handledThrough, jitter.delay, extResetTimes(&state)...)
+		if due := recoveries.nextDue(); !due.IsZero() {
+			due = due.Add(jitter.delay(due))
+			if next.IsZero() || due.Before(next) {
+				next = due
+			}
 		}
 		switch {
 		case expired:
@@ -2842,21 +2849,63 @@ func (t *quotaRecoveryTracker) nextDue() time.Time {
 	return next
 }
 
-// nextQuotaExpiry finds the earliest upcoming reset or credit expiry across the
-// Codex snapshot and any extra reset times (Antigravity / Claude windows).
-func nextQuotaExpiry(quota quotaSnapshot, now, handledThrough time.Time, extra ...time.Time) (time.Time, bool) {
+// refreshJitterMax bounds the random wait between a quota window or reset
+// credit expiring and the refresh it triggers, so that many clients do not all
+// query the server in the very same second.
+const refreshJitterMax = 30 * time.Second
+
+// refreshJitter draws one random delay in [0, refreshJitterMax) per expiry
+// instant and remembers it, so re-planning the timer (for example after another
+// refresh) never re-rolls the delay or lets the refresh fire early.
+type refreshJitter struct {
+	delays map[int64]time.Duration
+}
+
+func newRefreshJitter() *refreshJitter {
+	return &refreshJitter{delays: map[int64]time.Duration{}}
+}
+
+func (j *refreshJitter) delay(at time.Time) time.Duration {
+	key := at.UnixNano()
+	if d, ok := j.delays[key]; ok {
+		return d
+	}
+	d := time.Duration(rand.Int63n(int64(refreshJitterMax)))
+	j.delays[key] = d
+	return d
+}
+
+// forget drops the delays of expiries up to through, which have been handled.
+func (j *refreshJitter) forget(through time.Time) {
+	for key := range j.delays {
+		if key <= through.UnixNano() {
+			delete(j.delays, key)
+		}
+	}
+}
+
+// nextQuotaExpiry finds the earliest upcoming refresh time for a reset or
+// credit expiry across the Codex snapshot and any extra reset times
+// (Antigravity / Claude windows). Each expiry refreshes jitter(at) after it
+// passes (nil means immediately); expired reports that such a time has already
+// been reached.
+func nextQuotaExpiry(quota quotaSnapshot, now, handledThrough time.Time, jitter func(time.Time) time.Duration, extra ...time.Time) (time.Time, bool) {
 	var next time.Time
 	expired := false
 	consider := func(at time.Time) {
 		if at.IsZero() || (!handledThrough.IsZero() && !at.After(handledThrough)) {
 			return
 		}
-		if !at.After(now) {
+		due := at
+		if jitter != nil {
+			due = at.Add(jitter(at))
+		}
+		if !due.After(now) {
 			expired = true
 			return
 		}
-		if next.IsZero() || at.Before(next) {
-			next = at
+		if next.IsZero() || due.Before(next) {
+			next = due
 		}
 	}
 	for _, accounts := range [][]accountQuota{quota.Nominal, quota.Actual} {

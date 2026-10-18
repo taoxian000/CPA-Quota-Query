@@ -858,7 +858,7 @@ func TestNextQuotaExpiryFindsEarliestQuotaOrResetCreditExpiry(t *testing.T) {
 		}},
 	}
 
-	next, expired := nextQuotaExpiry(quota, now, time.Time{})
+	next, expired := nextQuotaExpiry(quota, now, time.Time{}, nil)
 	if expired {
 		t.Fatal("future quota expiries should not be considered expired")
 	}
@@ -873,15 +873,63 @@ func TestNextQuotaExpiryRequestsRefreshOnceAnyExpiryHasPassed(t *testing.T) {
 		Nominal: []accountQuota{{Primary: quotaBucket{ResetAt: now.Add(-time.Second)}}},
 		Actual:  []accountQuota{{Secondary: quotaBucket{ResetAt: now.Add(time.Hour)}}},
 	}
-	if _, expired := nextQuotaExpiry(quota, now, time.Time{}); !expired {
+	if _, expired := nextQuotaExpiry(quota, now, time.Time{}, nil); !expired {
 		t.Fatal("an expired quota bucket should request an immediate refresh")
 	}
-	next, expired := nextQuotaExpiry(quota, now, now)
+	next, expired := nextQuotaExpiry(quota, now, now, nil)
 	if expired {
 		t.Fatal("an expiry already handled by the forced refresh should not trigger again")
 	}
 	if want := now.Add(time.Hour); !next.Equal(want) {
 		t.Fatalf("next unhandled expiry = %v, want %v", next, want)
+	}
+}
+
+func TestNextQuotaExpiryWaitsForTheJitterAfterExpiry(t *testing.T) {
+	now := time.Date(2026, 10, 10, 10, 0, 0, 0, time.UTC)
+	reset := now.Add(-10 * time.Second)
+	quota := quotaSnapshot{Nominal: []accountQuota{{Primary: quotaBucket{ResetAt: reset}}}}
+	jitter := func(time.Time) time.Duration { return 25 * time.Second }
+
+	// 10 s after the reset with a 25 s delay: not due yet, due in 15 s.
+	next, expired := nextQuotaExpiry(quota, now, time.Time{}, jitter)
+	if expired {
+		t.Fatal("the refresh must wait for the random delay after the expiry")
+	}
+	if want := reset.Add(25 * time.Second); !next.Equal(want) {
+		t.Fatalf("refresh due at %v, want %v", next, want)
+	}
+	// Once the delay has elapsed the refresh is requested.
+	if _, expired := nextQuotaExpiry(quota, reset.Add(25*time.Second), time.Time{}, jitter); !expired {
+		t.Fatal("the refresh should be due once the delay has elapsed")
+	}
+}
+
+func TestRefreshJitterIsStableAndBounded(t *testing.T) {
+	jitter := newRefreshJitter()
+	at := time.Date(2026, 10, 10, 10, 0, 0, 0, time.UTC)
+	first := jitter.delay(at)
+	if first < 0 || first >= refreshJitterMax {
+		t.Fatalf("delay %v outside [0, %v)", first, refreshJitterMax)
+	}
+	// The same instant, even in another zone, keeps its delay.
+	if again := jitter.delay(at.In(time.FixedZone("x", 8*3600))); again != first {
+		t.Fatalf("delay changed from %v to %v for the same instant", first, again)
+	}
+	jitter.forget(at)
+	if len(jitter.delays) != 0 {
+		t.Fatalf("handled expiries should be forgotten, %d left", len(jitter.delays))
+	}
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 50; i++ {
+		d := jitter.delay(at.Add(time.Duration(i+1) * time.Minute))
+		if d < 0 || d >= refreshJitterMax {
+			t.Fatalf("delay %v outside [0, %v)", d, refreshJitterMax)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 10 {
+		t.Fatalf("only %d distinct delays in 50 draws; the jitter does not look random", len(seen))
 	}
 }
 
