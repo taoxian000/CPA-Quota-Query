@@ -17,7 +17,7 @@ import (
 // into 96×96 alpha masks. They are tinted with the card's title colour and
 // resampled to the device size at draw time, so they stay sharp at any DPI.
 //
-//go:embed icons/claude.png icons/codex.png icons/antigravity.png
+//go:embed icons/claude.png icons/codex.png icons/antigravity.png icons/factory.png
 var iconFiles embed.FS
 
 var (

@@ -23,13 +23,17 @@ const (
 	providerCodex       = "codex"
 	providerAntigravity = "antigravity"
 	providerClaude      = "claude"
+	providerFactory     = "factory"
 )
 
-var providerOrder = []string{providerCodex, providerAntigravity, providerClaude}
+var providerOrder = []string{providerCodex, providerAntigravity, providerClaude, providerFactory}
 
 func providerTitle(id string) string {
 	if id == "" {
 		return id
+	}
+	if id == providerFactory {
+		return "Factory Droid"
 	}
 	return strings.ToUpper(id[:1]) + id[1:]
 }
@@ -41,6 +45,7 @@ type providerConfig struct {
 	Enabled bool
 	BaseURL string `json:",omitempty"`
 	Email   string `json:",omitempty"`
+	APIKey  string `json:",omitempty"`
 }
 
 // providerEnabled treats Codex as enabled until the user says otherwise, so
@@ -120,6 +125,7 @@ type extGroup struct {
 	Name      string
 	Primary   quotaBucket
 	Secondary quotaBucket
+	Monthly   quotaBucket // Factory Droid only
 }
 
 type extQuota struct {
@@ -256,6 +262,9 @@ func fetchExtQuotaAt(client *http.Client, endpoint, apiKey, provider, email stri
 }
 
 func fetchExtQuota(provider string, cfg providerConfig) (extQuota, error) {
+	if provider == providerFactory {
+		return fetchFactoryQuota(cfg)
+	}
 	if strings.TrimSpace(cfg.Email) == "" {
 		return extQuota{}, errors.New("尚未设置 email")
 	}
@@ -289,7 +298,7 @@ func extResetTimes(s *appState) []time.Time {
 			continue
 		}
 		for _, group := range s.ext[id].Groups {
-			times = append(times, group.Primary.ResetAt, group.Secondary.ResetAt)
+			times = append(times, group.Primary.ResetAt, group.Secondary.ResetAt, group.Monthly.ResetAt)
 		}
 	}
 	return times
@@ -342,11 +351,15 @@ func extCardHeight(q extQuota) int32 {
 		return extDisconnectedBody
 	}
 	height := int32(bandHeight + 10 + 12)
-	for range max(len(q.Groups), 1) {
+	groups := q.Groups
+	if len(groups) == 0 {
+		groups = []extGroup{{}}
+	}
+	for _, group := range groups {
 		if len(q.Groups) > 1 {
 			height += extGroupHeaderHeight + extGroupGap
 		}
-		height += 2 * extRowPitch
+		height += int32(group.rowCount()) * extRowPitch
 	}
 	if len(q.Groups) > 1 {
 		height -= extGroupGap // no gap after the last group
@@ -414,6 +427,13 @@ func styleFor(id string, dark bool) providerStyle {
 			style.accent, style.accent2, style.onAccent = colorRef(63, 169, 245), colorRef(39, 211, 196), colorRef(11, 18, 32)
 		}
 		return style
+	case providerFactory:
+		accent := colorRef(232, 90, 20)
+		if dark {
+			accent = colorRef(247, 121, 52)
+		}
+		return providerStyle{accent: accent, accent2: accent, onAccent: colorRef(255, 255, 255),
+			radius: 16, face: "Microsoft YaHei UI", barHeight: 12}
 	default:
 		accent := colorRef(109, 63, 224)
 		if dark {
@@ -644,7 +664,10 @@ func drawExtCard(hdc uintptr, colors panelColors, section panelSection) {
 		}
 		drawStyledMeter(hdc, "5小时", 27, y, group.Primary, colors, look)
 		drawStyledMeter(hdc, "周额度", 27, y+extRowPitch, group.Secondary, colors, look)
-		y += 2 * extRowPitch
+		if group.Monthly.Known {
+			drawStyledMeter(hdc, "月额度", 27, y+2*extRowPitch, group.Monthly, colors, look)
+		}
+		y += int32(group.rowCount()) * extRowPitch
 	}
 }
 
@@ -672,6 +695,7 @@ const (
 	wsExClientEdge  = 0x00000200
 	wsExDlgFrame    = 0x00000001
 	esAutoHScroll   = 0x0080
+	esPassword      = 0x0020
 	bsPushButton    = 0x0000
 	bsDefPushButton = 0x0001
 	wmSetFont       = 0x0030
@@ -688,6 +712,7 @@ type providerDialog struct {
 	result   int
 	baseURL  string
 	email    string
+	apiKey   string
 	done     bool
 }
 
@@ -758,7 +783,10 @@ func (a *monitorApp) editProvider(id string) {
 	current := a.snapshot().settings.providerConfigFor(id)
 	dlg := &providerDialog{provider: id, current: current}
 
-	const clientW, clientH = 400, 196
+	clientW, clientH, buttonsTop := int32(400), int32(196), int32(148)
+	if id == providerFactory {
+		clientH, buttonsTop = 132, 84
+	}
 	style := uintptr(wsPopup | wsCaption | wsSysMenu)
 	exStyle := uintptr(wsExDlgFrame | wsExToolWindow | wsExTopmost)
 	frame := rect{Right: a.scale(clientW), Bottom: a.scale(clientH)}
@@ -786,20 +814,25 @@ func (a *monitorApp) editProvider(id string) {
 		0, 0, 0, 1, 0, 0, 5, 0,
 		uintptr(unsafe.Pointer(utf16Ptr("Microsoft YaHei UI"))),
 	)
-	baseHint := "base_url（例如 cpa.example.com）"
-	if id == providerCodex {
-		baseHint = "base_url（留空使用默认地址）"
+	if id == providerFactory {
+		a.createDialogControl("STATIC", "API Key（仅保存在本机）", 0, 0, 16, 14, 368, 20, dlg.hwnd, 0, font)
+		dlg.baseEdit = a.createDialogControl("EDIT", current.APIKey, wsTabStop|wsBorder|esAutoHScroll|esPassword, wsExClientEdge, 16, 36, 368, 26, dlg.hwnd, idDialogBase, font)
+	} else {
+		baseHint := "base_url（例如 cpa.example.com）"
+		if id == providerCodex {
+			baseHint = "base_url（留空使用默认地址）"
+		}
+		a.createDialogControl("STATIC", baseHint, 0, 0, 16, 14, 368, 20, dlg.hwnd, 0, font)
+		dlg.baseEdit = a.createDialogControl("EDIT", current.BaseURL, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 36, 368, 26, dlg.hwnd, idDialogBase, font)
+		emailHint := "email"
+		if id == providerCodex {
+			emailHint = "email（Codex 请求暂不使用，仅作记录）"
+		}
+		a.createDialogControl("STATIC", emailHint, 0, 0, 16, 74, 368, 20, dlg.hwnd, 0, font)
+		dlg.mailEdit = a.createDialogControl("EDIT", current.Email, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 96, 368, 26, dlg.hwnd, idDialogEmail, font)
 	}
-	a.createDialogControl("STATIC", baseHint, 0, 0, 16, 14, 368, 20, dlg.hwnd, 0, font)
-	dlg.baseEdit = a.createDialogControl("EDIT", current.BaseURL, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 36, 368, 26, dlg.hwnd, idDialogBase, font)
-	emailHint := "email"
-	if id == providerCodex {
-		emailHint = "email（Codex 请求暂不使用，仅作记录）"
-	}
-	a.createDialogControl("STATIC", emailHint, 0, 0, 16, 74, 368, 20, dlg.hwnd, 0, font)
-	dlg.mailEdit = a.createDialogControl("EDIT", current.Email, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 96, 368, 26, dlg.hwnd, idDialogEmail, font)
-	a.createDialogControl("BUTTON", "启用", wsTabStop|bsDefPushButton, 0, 196, 148, 90, 30, dlg.hwnd, idDialogOK, font)
-	a.createDialogControl("BUTTON", "禁用", wsTabStop|bsPushButton, 0, 294, 148, 90, 30, dlg.hwnd, idDialogDisable, font)
+	a.createDialogControl("BUTTON", "启用", wsTabStop|bsDefPushButton, 0, 196, buttonsTop, 90, 30, dlg.hwnd, idDialogOK, font)
+	a.createDialogControl("BUTTON", "禁用", wsTabStop|bsPushButton, 0, 294, buttonsTop, 90, 30, dlg.hwnd, idDialogDisable, font)
 
 	a.dialog = dlg
 	a.modalDepth++
@@ -843,6 +876,12 @@ func (a *monitorApp) handleDialogCommand(dlg *providerDialog, command uint16) {
 	case idDialogOK, idDialogDisable:
 		dlg.baseURL = windowText(dlg.baseEdit)
 		dlg.email = windowText(dlg.mailEdit)
+		if dlg.provider == providerFactory {
+			if !a.finishFactoryDialog(dlg, command) {
+				return
+			}
+			break
+		}
 		if command == idDialogOK {
 			cfg, err := validateProviderInput(dlg.provider, dlg.baseURL, dlg.email)
 			if err != nil {
@@ -869,9 +908,9 @@ func (a *monitorApp) handleDialogCommand(dlg *providerDialog, command uint16) {
 }
 
 func (a *monitorApp) applyProviderDialog(id string, dlg *providerDialog) {
-	cfg := providerConfig{Enabled: dlg.result == dlgEnable, BaseURL: dlg.baseURL, Email: dlg.email}
+	cfg := providerConfig{Enabled: dlg.result == dlgEnable, BaseURL: dlg.baseURL, Email: dlg.email, APIKey: dlg.apiKey}
 	a.state.mu.Lock()
-	changed := cfg.BaseURL != dlg.current.BaseURL || !strings.EqualFold(cfg.Email, dlg.current.Email)
+	changed := cfg.BaseURL != dlg.current.BaseURL || !strings.EqualFold(cfg.Email, dlg.current.Email) || cfg.APIKey != dlg.current.APIKey
 	a.state.settings = a.state.settings.withProvider(id, cfg)
 	if changed {
 		if id == providerCodex {
