@@ -1864,7 +1864,7 @@ func (a *monitorApp) drawPanel(hdc uintptr, s *appState) {
 	drawPanelButton(hdc, panelExitButtonRect(), "×", colors)
 
 	if len(sections) == 0 {
-		drawText(hdc, "尚未启用任何 Provider。右键托盘图标，勾选 Codex / Antigravity / Claude / Factory Droid。",
+		drawText(hdc, "尚未启用任何 Provider。右键托盘图标，勾选 Codex / Antigravity / Claude / Factory Droid / Kiro。",
 			rect{Left: 18, Top: panelHeaderHeight, Right: panelWidth - 18, Bottom: panelHeaderHeight + emptyPanelHintHeight},
 			colors.muted, dtSingleLine|dtVCenter|dtEndEllipsis)
 		return

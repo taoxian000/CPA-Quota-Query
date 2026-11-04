@@ -24,9 +24,12 @@ const (
 	providerAntigravity = "antigravity"
 	providerClaude      = "claude"
 	providerFactory     = "factory"
+	providerKiro        = "kiro"
+
+	defaultKiroURL = "https://kot.xkcht.eu.org"
 )
 
-var providerOrder = []string{providerCodex, providerAntigravity, providerClaude, providerFactory}
+var providerOrder = []string{providerCodex, providerAntigravity, providerClaude, providerFactory, providerKiro}
 
 func providerTitle(id string) string {
 	if id == "" {
@@ -110,7 +113,7 @@ func validateProviderInput(id, baseURL, email string) (providerConfig, error) {
 		return providerConfig{}, err
 	}
 	email = strings.TrimSpace(email)
-	if id != providerCodex && email == "" {
+	if id != providerCodex && id != providerKiro && email == "" {
 		return providerConfig{}, errors.New("请输入 email。")
 	}
 	if id == providerCodex && base == defaultServerURL {
@@ -223,7 +226,10 @@ func extQuotaURL(baseURL, provider, email string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	query := url.Values{"provider": {provider}, "email": {email}}
+	query := url.Values{"provider": {provider}}
+	if email != "" {
+		query.Set("email", email)
+	}
 	return endpoints.quota + "?" + query.Encode(), nil
 }
 
@@ -258,6 +264,9 @@ func fetchExtQuotaAt(client *http.Client, endpoint, apiKey, provider, email stri
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxQuotaResponseBytes)).Decode(&envelope); err != nil {
 		return extQuota{}, fmt.Errorf("解析额度响应失败：%w", err)
 	}
+	if provider == providerKiro {
+		return parseKiroQuota(envelope)
+	}
 	return parseExtQuota(envelope, email)
 }
 
@@ -265,7 +274,7 @@ func fetchExtQuota(provider string, cfg providerConfig) (extQuota, error) {
 	if provider == providerFactory {
 		return fetchFactoryQuota(cfg)
 	}
-	if strings.TrimSpace(cfg.Email) == "" {
+	if provider != providerKiro && strings.TrimSpace(cfg.Email) == "" {
 		return extQuota{}, errors.New("尚未设置 email")
 	}
 	if strings.TrimSpace(cfg.BaseURL) == "" {
@@ -427,6 +436,13 @@ func styleFor(id string, dark bool) providerStyle {
 			style.accent, style.accent2, style.onAccent = colorRef(63, 169, 245), colorRef(39, 211, 196), colorRef(11, 18, 32)
 		}
 		return style
+	case providerKiro:
+		accent := colorRef(144, 70, 255)
+		if dark {
+			accent = colorRef(167, 111, 255)
+		}
+		return providerStyle{accent: accent, accent2: accent, onAccent: colorRef(255, 255, 255),
+			radius: 16, face: "Microsoft YaHei UI", barHeight: 12}
 	case providerFactory:
 		accent := colorRef(232, 90, 20)
 		if dark {
@@ -662,10 +678,14 @@ func drawExtCard(hdc uintptr, colors panelColors, section panelSection) {
 			drawText(hdc, group.Name, rect{Left: 27, Top: y - 8, Right: panelWidth - 25, Bottom: y + 12}, colors.text, dtSingleLine|dtVCenter|dtEndEllipsis)
 			y += extGroupHeaderHeight
 		}
-		drawStyledMeter(hdc, "5小时", 27, y, group.Primary, colors, look)
-		drawStyledMeter(hdc, "周额度", 27, y+extRowPitch, group.Secondary, colors, look)
-		if group.Monthly.Known {
-			drawStyledMeter(hdc, "月额度", 27, y+2*extRowPitch, group.Monthly, colors, look)
+		if group.monthlyOnly() {
+			drawStyledMeter(hdc, "月额度", 27, y, group.Monthly, colors, look)
+		} else {
+			drawStyledMeter(hdc, "5小时", 27, y, group.Primary, colors, look)
+			drawStyledMeter(hdc, "周额度", 27, y+extRowPitch, group.Secondary, colors, look)
+			if group.Monthly.Known {
+				drawStyledMeter(hdc, "月额度", 27, y+2*extRowPitch, group.Monthly, colors, look)
+			}
 		}
 		y += int32(group.rowCount()) * extRowPitch
 	}
@@ -784,7 +804,7 @@ func (a *monitorApp) editProvider(id string) {
 	dlg := &providerDialog{provider: id, current: current}
 
 	clientW, clientH, buttonsTop := int32(400), int32(196), int32(148)
-	if id == providerFactory {
+	if id == providerFactory || id == providerKiro {
 		clientH, buttonsTop = 132, 84
 	}
 	style := uintptr(wsPopup | wsCaption | wsSysMenu)
@@ -822,14 +842,20 @@ func (a *monitorApp) editProvider(id string) {
 		if id == providerCodex {
 			baseHint = "base_url（留空使用默认地址）"
 		}
-		a.createDialogControl("STATIC", baseHint, 0, 0, 16, 14, 368, 20, dlg.hwnd, 0, font)
-		dlg.baseEdit = a.createDialogControl("EDIT", current.BaseURL, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 36, 368, 26, dlg.hwnd, idDialogBase, font)
-		emailHint := "email"
-		if id == providerCodex {
-			emailHint = "email（Codex 请求暂不使用，仅作记录）"
+		baseValue := current.BaseURL
+		if id == providerKiro && baseValue == "" {
+			baseValue = defaultKiroURL
 		}
-		a.createDialogControl("STATIC", emailHint, 0, 0, 16, 74, 368, 20, dlg.hwnd, 0, font)
-		dlg.mailEdit = a.createDialogControl("EDIT", current.Email, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 96, 368, 26, dlg.hwnd, idDialogEmail, font)
+		a.createDialogControl("STATIC", baseHint, 0, 0, 16, 14, 368, 20, dlg.hwnd, 0, font)
+		dlg.baseEdit = a.createDialogControl("EDIT", baseValue, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 36, 368, 26, dlg.hwnd, idDialogBase, font)
+		if id != providerKiro {
+			emailHint := "email"
+			if id == providerCodex {
+				emailHint = "email（Codex 请求暂不使用，仅作记录）"
+			}
+			a.createDialogControl("STATIC", emailHint, 0, 0, 16, 74, 368, 20, dlg.hwnd, 0, font)
+			dlg.mailEdit = a.createDialogControl("EDIT", current.Email, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 96, 368, 26, dlg.hwnd, idDialogEmail, font)
+		}
 	}
 	a.createDialogControl("BUTTON", "启用", wsTabStop|bsDefPushButton, 0, 196, buttonsTop, 90, 30, dlg.hwnd, idDialogOK, font)
 	a.createDialogControl("BUTTON", "禁用", wsTabStop|bsPushButton, 0, 294, buttonsTop, 90, 30, dlg.hwnd, idDialogDisable, font)

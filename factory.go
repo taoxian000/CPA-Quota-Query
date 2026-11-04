@@ -61,9 +61,18 @@ func (tier factoryTier) exhausted() bool {
 	return false
 }
 
+// monthlyOnly marks a group with just a monthly bucket (Kiro accounts), which
+// is drawn as a single meter.
+func (group extGroup) monthlyOnly() bool {
+	return group.Monthly.Known && !group.Primary.Known && !group.Secondary.Known
+}
+
 // rowCount is the number of meter rows a group draws; only Factory Droid has
 // a monthly window.
 func (group extGroup) rowCount() int {
+	if group.monthlyOnly() {
+		return 1
+	}
 	if group.Monthly.Known {
 		return 3
 	}
