@@ -33,7 +33,7 @@ const (
 
 var (
 	// appVersion is overridden at build time with -X main.appVersion=<tag>.
-	appVersion       = "v1.10"
+	appVersion       = "v1.11"
 	procShellExecute = shell32.NewProc("ShellExecuteW")
 	errNoRelease     = errors.New("尚无正式 Release")
 )

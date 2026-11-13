@@ -23,13 +23,14 @@ const (
 	providerCodex       = "codex"
 	providerAntigravity = "antigravity"
 	providerClaude      = "claude"
+	providerClaudeCindy = "claude-cindy"
 	providerFactory     = "factory"
 	providerKiro        = "kiro"
 
 	defaultKiroURL = "https://kot.xkcht.eu.org"
 )
 
-var providerOrder = []string{providerCodex, providerAntigravity, providerClaude, providerFactory, providerKiro}
+var providerOrder = []string{providerCodex, providerAntigravity, providerClaude, providerFactory, providerKiro, providerClaudeCindy}
 
 func providerTitle(id string) string {
 	if id == "" {
@@ -37,6 +38,9 @@ func providerTitle(id string) string {
 	}
 	if id == providerFactory {
 		return "Factory Droid"
+	}
+	if id == providerClaudeCindy {
+		return "Claude"
 	}
 	return strings.ToUpper(id[:1]) + id[1:]
 }
@@ -108,6 +112,9 @@ func normalizeBaseURL(input string, allowEmpty bool) (string, error) {
 }
 
 func validateProviderInput(id, baseURL, email string) (providerConfig, error) {
+	if id == providerClaudeCindy {
+		return validateClaudeCindyInput(baseURL, email)
+	}
 	base, err := normalizeBaseURL(baseURL, id == providerCodex)
 	if err != nil {
 		return providerConfig{}, err
@@ -271,6 +278,9 @@ func fetchExtQuotaAt(client *http.Client, endpoint, apiKey, provider, email stri
 }
 
 func fetchExtQuota(provider string, cfg providerConfig) (extQuota, error) {
+	if provider == providerClaudeCindy {
+		return fetchClaudeCindyQuota(cfg)
+	}
 	if provider == providerFactory {
 		return fetchFactoryQuota(cfg)
 	}
@@ -422,7 +432,7 @@ type providerStyle struct {
 
 func styleFor(id string, dark bool) providerStyle {
 	switch id {
-	case providerClaude:
+	case providerClaude, providerClaudeCindy:
 		accent := colorRef(196, 98, 63)
 		if dark {
 			accent = colorRef(217, 119, 87)
@@ -588,10 +598,14 @@ func drawCardShell(hdc uintptr, colors panelColors, look cardLook, top, height i
 	text := look.bandText(colors)
 	drawIcon(hdc, look.id, rect{Left: 24, Top: top + 5, Right: 44, Bottom: top + 25}, text)
 
+	titleRight := int32(162)
+	if look.id == providerClaudeCindy {
+		titleRight = 196
+	}
 	withFont(hdc, style.face, -17, 700, func() {
-		drawText(hdc, providerTitle(look.id), rect{Left: 52, Top: top + 1, Right: 162, Bottom: top + bandHeight}, text, dtSingleLine|dtVCenter)
+		drawText(hdc, providerTitle(look.id), rect{Left: 52, Top: top + 1, Right: titleRight, Bottom: top + bandHeight}, text, dtSingleLine|dtVCenter)
 	})
-	drawText(hdc, detail, rect{Left: 166, Top: top + 1, Right: panelWidth - 25, Bottom: top + bandHeight}, text, dtSingleLine|dtVCenter|dtEndEllipsis)
+	drawText(hdc, detail, rect{Left: titleRight + 4, Top: top + 1, Right: panelWidth - 25, Bottom: top + bandHeight}, text, dtSingleLine|dtVCenter|dtEndEllipsis)
 }
 
 func drawStyledMeter(hdc uintptr, label string, left, top int32, bucket quotaBucket, colors panelColors, look cardLook) {
@@ -680,6 +694,8 @@ func drawExtCard(hdc uintptr, colors panelColors, section panelSection) {
 		}
 		if group.monthlyOnly() {
 			drawStyledMeter(hdc, "月额度", 27, y, group.Monthly, colors, look)
+		} else if group.weeklyOnly() {
+			drawStyledMeter(hdc, "周额度", 27, y, group.Secondary, colors, look)
 		} else {
 			drawStyledMeter(hdc, "5小时", 27, y, group.Primary, colors, look)
 			drawStyledMeter(hdc, "周额度", 27, y+extRowPitch, group.Secondary, colors, look)
@@ -841,10 +857,14 @@ func (a *monitorApp) editProvider(id string) {
 		baseHint := "base_url（例如 cpa.example.com）"
 		if id == providerCodex {
 			baseHint = "base_url（留空使用默认地址）"
+		} else if id == providerClaudeCindy {
+			baseHint = "URL（完整额度接口地址）"
 		}
 		baseValue := current.BaseURL
 		if id == providerKiro && baseValue == "" {
 			baseValue = defaultKiroURL
+		} else if id == providerClaudeCindy && baseValue == "" {
+			baseValue = defaultClaudeCindyURL
 		}
 		a.createDialogControl("STATIC", baseHint, 0, 0, 16, 14, 368, 20, dlg.hwnd, 0, font)
 		dlg.baseEdit = a.createDialogControl("EDIT", baseValue, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 36, 368, 26, dlg.hwnd, idDialogBase, font)
@@ -852,6 +872,8 @@ func (a *monitorApp) editProvider(id string) {
 			emailHint := "email"
 			if id == providerCodex {
 				emailHint = "email（Codex 请求暂不使用，仅作记录）"
+			} else if id == providerClaudeCindy {
+				emailHint = "email（仅用于显示）"
 			}
 			a.createDialogControl("STATIC", emailHint, 0, 0, 16, 74, 368, 20, dlg.hwnd, 0, font)
 			dlg.mailEdit = a.createDialogControl("EDIT", current.Email, wsTabStop|wsBorder|esAutoHScroll, wsExClientEdge, 16, 96, 368, 26, dlg.hwnd, idDialogEmail, font)

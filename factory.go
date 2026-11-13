@@ -67,10 +67,14 @@ func (group extGroup) monthlyOnly() bool {
 	return group.Monthly.Known && !group.Primary.Known && !group.Secondary.Known
 }
 
-// rowCount is the number of meter rows a group draws; only Factory Droid has
-// a monthly window.
+// weeklyOnly marks model-scoped Claude(Cindy) groups with one weekly meter.
+func (group extGroup) weeklyOnly() bool {
+	return group.Secondary.Known && !group.Primary.Known && !group.Monthly.Known
+}
+
+// rowCount is the number of meter rows a group draws.
 func (group extGroup) rowCount() int {
-	if group.monthlyOnly() {
+	if group.monthlyOnly() || group.weeklyOnly() {
 		return 1
 	}
 	if group.Monthly.Known {

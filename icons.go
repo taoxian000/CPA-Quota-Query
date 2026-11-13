@@ -40,6 +40,9 @@ type iconKey struct {
 
 // iconMask decodes (once) the alpha mask of a provider logo.
 func iconMask(id string) *image.Gray {
+	if id == providerClaudeCindy {
+		id = providerClaude
+	}
 	if mask, ok := iconMasks[id]; ok {
 		return mask
 	}
